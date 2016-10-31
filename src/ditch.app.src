@@ -1,0 +1,13 @@
+{application, ditch,
+[
+{description, ""},
+{vsn, "1"},
+{registered, []},
+{applications, [
+kernel,
+stdlib,
+  common
+]},
+{mod, { ditch_app, []}},
+{env, []}
+]}.

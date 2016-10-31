@@ -1,0 +1,10 @@
+{application,ditch,
+             [{description,[]},
+              {vsn,"1"},
+              {registered,[]},
+              {applications,[kernel,stdlib,common]},
+              {mod,{ditch_app,[]}},
+              {env,[]},
+              {modules,[ditch,ditch_app,ditch_buffer,ditch_buffer_test,
+                        ditch_conns,ditch_kcp,ditch_listener_sup,ditch_queue,
+                        ditch_server,ditch_sup,simplecallback]}]}.
