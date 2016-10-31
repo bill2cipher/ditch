@@ -237,7 +237,7 @@ handle_recv_pkg(IP, Port, Data, State) ->
   case handle_recv_pkg2(OldKCP, IP, Port, State, Args, Data) of
     {ok, State2 = #state{cb_pid = RecvPID}} ->
       KCP = get({IP, Port}),
-      KCP2 = check_data_rcv(IP, Port, OldKCP, KCP, RecvPID),
+      KCP2 = check_data_rcv(OldKCP, KCP, RecvPID),
       put({IP, Port}, KCP2),
       {ok, State2};
     {error, Reason, State2} ->
@@ -269,10 +269,11 @@ handle_recv_pkg2(KCP, IP, Port, State, {MaxAck, _},
     _ ->
       {KCP2, State2} = case KCP of
         undefined ->
-          #state{next_conv = NextConv} = State,
+          #state{next_conv = NextConv, cb_pid = RecvPID, sock = Socket} = State,
           PCB = #kcp_pcb{conv = NextConv, key = {IP, Port}, state = ?KCP_STATE_ACTIVE,
             rmt_wnd = Wnd, probe = ?KCP_SYNC_ACK_SEND},
           put({IP, Port}, PCB),
+          RecvPID ! {shoot, Socket, NextConv},
           {PCB, State#state{next_conv = NextConv + 1}};
         PCB -> {PCB, State}
       end,
@@ -378,16 +379,10 @@ kcp_update_ack(KCP, RTT) ->
       KCP#kcp_pcb{rx_srtt = RTT, rx_rttval = RTT div 2};
     false ->
       Delta = RTT - KCP#kcp_pcb.rx_srtt,
-      Delta2 = case Delta < 0 of
-        true  -> -Delta;
-        false -> Delta
-      end,
+      Delta2 = ?IF(Delta < 0, -Delta, Delta),
       RxRttVal = (3 * KCP#kcp_pcb.rx_rttval + Delta2) div 4,
       RxSRttVal = (7 * KCP#kcp_pcb.rx_srtt + RTT) div 8,
-      RxSRttVal2 = case RxSRttVal < 1 of
-        true -> 1;
-        false -> RxSRttVal
-      end,
+      RxSRttVal2 = ?IF(RxSRttVal < 1, 1, RxSRttVal),
       KCP#kcp_pcb{rx_srtt = RxSRttVal2, rx_rttval = RxRttVal}
   end,
   Rto = KCP2#kcp_pcb.rx_srtt + lists:max([1, 4 * KCP2#kcp_pcb.rx_rttval]),
@@ -452,10 +447,7 @@ kcp_parse_una2(SndBuf, Idx, Prev, Una) ->
   kcp_parse_una2(SndBuf2, Next2, Idx, Una).
 
 kcp_rcv_finish(KCP, MaxAck, Una) ->
-  KCP2 = case MaxAck of
-    undefined -> KCP;
-    _ -> kcp_parse_fastack(KCP, MaxAck)
-  end,
+  KCP2 = ?IF(MaxAck =:= undefined, KCP, kcp_parse_fastack(KCP, MaxAck)),
   kcp_rcv_finish2(KCP2, Una).
 
 kcp_rcv_finish2(KCP = #kcp_pcb{snd_una = SndUna, cwnd = Cwnd, rmt_wnd = Rwnd}, Una)
@@ -468,10 +460,7 @@ kcp_rcv_finish2(KCP, _Una) ->
     false ->
       In2 = ?MAX(Incr, Mss),
       In3 = In2 + (Mss * Mss) div In2 + (Mss div 16),
-      C2 = case (Cwnd + 1) * Mss =< In3 of
-        true -> Cwnd + 1;
-        false -> Cwnd
-      end,
+      C2 = ?IF((Cwnd + 1) * Mss =< In3, Cwnd + 1, Cwnd),
       {C2, In3}
   end,
   case Cwnd2 > Rwnd of
@@ -520,23 +509,24 @@ check_and_move2(RcvNxt, Prev, Idx, RcvBuf, RcvQueue) ->
       Next = ditch_buffer:next(Idx, RcvBuf),
       RcvBuf2 = ditch_buffer:delete(Idx, Prev, RcvBuf),
       RcvQueue2 = ditch_queue:in(Seg, RcvQueue),
-      Prev2 = case ditch_buffer:first(RcvBuf2) =:= Next of
-        true  -> ?LAST_INDEX;
-        false -> Idx
-      end,
+      Prev2 = ?IF(ditch_buffer:first(RcvBuf2) =:= Next, ?LAST_INDEX, Idx),
       check_and_move2(RcvNxt + 1, Prev2, Next, RcvBuf2, RcvQueue2);
     _ -> {RcvNxt, RcvBuf, RcvQueue}
   end.
 
-check_data_rcv(IP, Port, OldKCP, KCP, RecvPID) ->
+check_data_rcv(OldKCP, KCP, RecvPID) ->
   #kcp_pcb{rcv_queue = OldQue} = OldKCP,
-  #kcp_pcb{rcv_queue = RcvQue, datalist = DataList, probe = Probe} = KCP,
+  #kcp_pcb{rcv_queue = RcvQue, probe = Probe, rcv_nxt = RcvNxt, rcv_buf = RcvBuf,
+    rcv_wnd = RcvWnd} = KCP,
+  Recover = ditch_queue:len(RcvQue) >= RcvWnd,
   case ditch_queue:len(OldQue) =:= ditch_queue:len(RcvQue) of
     true  -> KCP;
     false ->
-      {RcvQue2, DataList2} = check_data_rcv2(RcvQue, [], DataList),
-      RecvPID ! {kcp_rcv_data, {IP, Port}},
-      KCP#kcp_pcb{rcv_queue = RcvQue2, datalist = DataList2, probe = Probe bor ?KCP_ASK_TELL}
+      {RcvQue2, DataList} = check_data_rcv2(RcvQue, [], []),
+      {RcvNxt2, RcvBuf2, RcvQue3} = check_and_move(RcvNxt, RcvBuf, RcvQue2),
+      RecvPID ! {kcp_data, KCP#kcp_pcb.conv, DataList},
+      Probe2 = ?IF(Recover and (ditch_queue:len(RcvQue3) < RcvWnd), Probe bor ?KCP_ASK_TELL, Probe),
+      KCP#kcp_pcb{rcv_nxt = RcvNxt2, rcv_queue = RcvQue3, rcv_buf = RcvBuf2, probe = Probe2}
   end.
 
 check_data_rcv2(RcvQue, PartList, DataList) ->
@@ -562,10 +552,7 @@ check_data_rcv2(RcvQue, PartList, DataList) ->
 %% Flush all sndbuf data out
 kcp_update(Now, Socket, KCP) ->
   #kcp_pcb{updated = Updated, ts_flush = TsFlush, interval = Interval} = KCP,
-  {Updated2, TsFlush2} = case Updated =:= false of
-    true -> {true, Now};
-    false -> {Updated, TsFlush}
-  end,
+  {Updated2, TsFlush2} = ?IF(Updated =:= false, {true, Now}, {Updated, TsFlush}),
   Slap = Now - TsFlush2,
   {Slap2, TsFlush3} = case (Slap >= 10000) or (Slap < -10000) of
     true -> {0, Now};
@@ -576,21 +563,18 @@ kcp_update(Now, Socket, KCP) ->
       KCP#kcp_pcb{current = Now, ts_flush = TsFlush3, updated = Updated2};
     true  ->
       TsFlush4 = TsFlush3 + Interval,
-      TsFlush5 = case Now > TsFlush4 of
-        true -> Now + Interval;
-        false -> TsFlush4
-      end,
+      TsFlush5 = ?IF(Now > TsFlush4, Now + Interval, TsFlush4),
       kcp_flush(Socket, KCP#kcp_pcb{current = Now, ts_flush = TsFlush5, updated = Updated2})
   end.
 
-
+%% Flush all data into the internet
 kcp_flush(_Socket, KCP = #kcp_pcb{updated = false}) -> KCP;
 kcp_flush(Socket, KCP) ->
   #kcp_pcb{conv = Conv, rcv_nxt = RcvNxt, rcv_queue = RcvQue, rcv_wnd = RWnd,
-    current = Current, rx_rto = Rto} = KCP,
-  Wnd = RWnd - ditch_queue:len(RcvQue),
+    rx_rto = Rto} = KCP,
+  Wnd = ?IF(ditch_queue:len(RcvQue) < RWnd, RWnd - ditch_queue:len(RcvQue), 0),
   Seg = #kcp_seg{conv = Conv, cmd = ?KCP_CMD_ACK, frg = 0, wnd = Wnd, una = RcvNxt,
-    ts = Current, rto = Rto, resendts = Current, fastack = 0, xmit = 0},
+    ts = 0, sn = 0, len = 0},
   {KCP2, Buf2} = kcp_flush_ack(Socket, KCP, Seg),
   {KCP3, Buf3} = kcp_probe_wnd(Socket, KCP2, Seg, Buf2),
   {KCP4, Buf4} = kcp_flush_wnd(Socket, KCP3, Seg, Buf3),
@@ -611,8 +595,34 @@ kcp_flush_ack2(Socket, Key, Seg, [{Sn, Ts} | Left], Buf, Size, Limit) ->
   kcp_flush_ack2(Socket, Key, Seg, Left, Buf2, Size2, Limit).
 
 %% Do not implement wnd probe right now
-kcp_probe_wnd(_Socket, KCP, _Seg, Buf) -> {KCP, Buf}.
-
+kcp_probe_wnd(Socket, KCP, Seg, {Buf, Size}) ->
+  KCP2 = kcp_update_probe(KCP),
+  #kcp_pcb{key = Key, probe = Probe, mtu = Mtu} = KCP2,
+  #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
+  case (Probe band ?KCP_ASK_SEND) =/= 0 of
+    false -> {KCP2, Buf};
+    true  ->
+      Bin = ?KCP_SEG(Conv, ?KCP_CMD_WASK, 0, Wnd, 0, 0, Una, 0, <<>>, <<>>),
+      Buf2 = kcp_output(Socket, Key, Bin, Buf, Size, Mtu),
+      {KCP2, Buf2}
+  end.
+kcp_update_probe(KCP = #kcp_pcb{rmt_wnd = Rwnd}) when Rwnd =/= 0 ->
+  KCP#kcp_pcb{ts_probe = 0, probe_wait = 0};
+kcp_update_probe(KCP) ->
+  #kcp_pcb{current = Current, ts_probe = TsProbe, probe_wait = PWait, probe = Probe} = KCP,
+  case KCP#kcp_pcb.probe_wait =:= 0 of
+    true ->
+      KCP#kcp_pcb{probe_wait = ?KCP_PROBE_INIT, ts_probe = Current + ?KCP_PROBE_INIT};
+    false when Current >= TsProbe ->
+      PWait2 = ?IF(PWait < ?KCP_PROBE_INIT, ?KCP_PROBE_INIT, PWait),
+      PWait3 = PWait2 + PWait2 div 2,
+      PWait4 = ?IF(PWait3 > ?KCP_PROBE_LIMIT, ?KCP_PROBE_LIMIT, PWait3),
+      TsProbe2 = Current + PWait4,
+      Probe2 = Probe bor ?KCP_ASK_SEND,
+      KCP#kcp_pcb{probe_wait = PWait4, ts_probe = TsProbe2, probe = Probe2};
+    false ->
+      KCP
+  end.
 kcp_flush_wnd(_Socket, KCP = #kcp_pcb{probe = Probe}, _Seg, Buf)
     when Probe band ?KCP_ASK_TELL =:= 0 -> {KCP, Buf};
 kcp_flush_wnd(Socket, KCP, Seg, {Buf, Size}) ->
@@ -622,41 +632,16 @@ kcp_flush_wnd(Socket, KCP, Seg, {Buf, Size}) ->
   Buf2 = kcp_output(Socket, Key, Bin, Buf, Size, Mtu),
   {KCP, Buf2}.
 
-%%kcp_flush_syncack(_Socket, KCP = #kcp_pcb{probe = Probe}, _Seg, Buf)
-%%    when Probe band ?KCP_SYNC_ACK_SEND =:= 0 -> {KCP, Buf};
-%%kcp_flush_syncack(Socket, KCP, Seg, {Buf, Size}) ->
-%%  #kcp_pcb{key = Key, mtu = Mtu} = KCP,
-%%  #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
-%%  Bin = ?KCP_SEG(Conv, ?KCP_CMD_SYNC_ACK, 0, Wnd, 0, 0, Una, 0, <<>>, <<>>),
-%%  Buf2 = kcp_output(Socket, Key, Bin, Buf, Size, Mtu),
-%%  {KCP, Buf2}.
-%%
-%%kcp_flush_sync(_Socket, KCP = #kcp_pcb{probe = Probe}, _Seg, Buf)
-%%    when Probe band ?KCP_SYNC_SEND =:= 0 -> {KCP, Buf};
-%%kcp_flush_sync(Socket, KCP, Seg, {Buf, Size}) ->
-%%  #kcp_pcb{key = Key, mtu = Mtu} = KCP,
-%%  #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
-%%  Bin = ?KCP_SEG(Conv, ?KCP_CMD_SYNC, 0, Wnd, 0, 0, Una, 0, <<>>, <<>>),
-%%  Buf2 = kcp_output(Socket, Key, Bin, Buf, Size, Mtu),
-%%  {KCP, Buf2}.
 
 kcp_flush_data(Socket, KCP, Seg, Buf) ->
-  #kcp_pcb{snd_wnd = SWnd, rmt_wnd = RWnd, nocwnd = NoCwnd, cwnd = CWnd} = KCP,
-  CalWnd = lists:min([SWnd, RWnd]),
-  CalWnd2 = case NoCwnd =:= 0 of
-    true -> lists:min([CWnd, CalWnd]);
-    false -> CalWnd
-  end,
+  #kcp_pcb{snd_wnd = SWnd, rmt_wnd = RWnd, nocwnd = NoCwnd, cwnd = CWnd,
+    fastresend = FastResend, nodelay = NoDelay, rx_rto = RxRto} = KCP,
+  CalWnd = ?MIN(SWnd, RWnd),
+  CalWnd2 = ?IF(NoCwnd =:= 0, ?MIN(CWnd, CalWnd), CalWnd),
   KCP2 = sndque_to_sndbuf(KCP, Seg, CalWnd2),
-  FastResent = case KCP2#kcp_pcb.fastresend > 0 of
-    true  -> KCP2#kcp_pcb.fastresend;
-    false -> 16#FFFFFFFF
-  end,
-  RtoMin = case KCP2#kcp_pcb.nodelay == 0 of
-    true  -> KCP2#kcp_pcb.rx_rto bsr 3;
-    false -> 0
-  end,
-  {KCP3, Buf2} = kcp_flush_data2(Socket, KCP2, Buf, FastResent, RtoMin, CalWnd2),
+  Resent = ?IF(FastResend > 0, FastResend, 16#FFFFFFFF),
+  RtoMin = ?IF(NoDelay == 0, RxRto bsr 3, 0),
+  {KCP3, Buf2} = kcp_flush_data2(Socket, KCP2, Buf, Resent, RtoMin, CalWnd2),
   {KCP3, Buf2}.
 
 kcp_flush_data2(Socket, KCP, Buf, FastResent, RtoMin, CWnd) ->
@@ -730,7 +715,9 @@ sndque_to_sndbuf(KCP, Seg, CWnd) ->
   #kcp_pcb{snd_queue = SndQue, snd_buf = SndBuf, snd_nxt = SndNxt, snd_una = SndUna} = KCP,
   case ditch_queue:len(SndQue) =:= 0 of
     true -> KCP;
-    false -> sndque_to_sndbuf2(SndNxt, SndUna + CWnd, Seg, SndQue, SndBuf)
+    false ->
+      {SndNxt2, SndQue2, SndBuf2} = sndque_to_sndbuf2(SndNxt, SndUna + CWnd, Seg, SndQue, SndBuf),
+      KCP#kcp_pcb{snd_nxt = SndNxt2, snd_queue = SndQue2, snd_buf = SndBuf2}
   end.
 sndque_to_sndbuf2(SndNxt, Limit, _Seg, SndQue, SndBuf) when SndNxt >= Limit ->
   {SndNxt, SndQue, SndBuf};
@@ -763,6 +750,24 @@ kcp_output2(Socket, {IP, Port}, Data) ->
       ?ERRORLOG("send udp data to ~p failed with reason ~p", [{IP, Port}, Reason]),
       {error, Reason}
   end.
+
+%%kcp_flush_syncack(_Socket, KCP = #kcp_pcb{probe = Probe}, _Seg, Buf)
+%%    when Probe band ?KCP_SYNC_ACK_SEND =:= 0 -> {KCP, Buf};
+%%kcp_flush_syncack(Socket, KCP, Seg, {Buf, Size}) ->
+%%  #kcp_pcb{key = Key, mtu = Mtu} = KCP,
+%%  #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
+%%  Bin = ?KCP_SEG(Conv, ?KCP_CMD_SYNC_ACK, 0, Wnd, 0, 0, Una, 0, <<>>, <<>>),
+%%  Buf2 = kcp_output(Socket, Key, Bin, Buf, Size, Mtu),
+%%  {KCP, Buf2}.
+%%
+%%kcp_flush_sync(_Socket, KCP = #kcp_pcb{probe = Probe}, _Seg, Buf)
+%%    when Probe band ?KCP_SYNC_SEND =:= 0 -> {KCP, Buf};
+%%kcp_flush_sync(Socket, KCP, Seg, {Buf, Size}) ->
+%%  #kcp_pcb{key = Key, mtu = Mtu} = KCP,
+%%  #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
+%%  Bin = ?KCP_SEG(Conv, ?KCP_CMD_SYNC, 0, Wnd, 0, 0, Una, 0, <<>>, <<>>),
+%%  Buf2 = kcp_output(Socket, Key, Bin, Buf, Size, Mtu),
+%%  {KCP, Buf2}.
 
 dump_kcp(#kcp_pcb{snd_buf = SndBuf, rcv_buf = RcvBuf}) ->
   NSndBuf = ditch_buffer:unused(SndBuf),

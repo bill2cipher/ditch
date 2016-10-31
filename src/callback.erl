@@ -110,9 +110,10 @@ handle_cast(_Request, State) ->
   {noreply, NewState :: #state{}, timeout() | hibernate} |
   {stop, Reason :: term(), NewState :: #state{}}).
 handle_info({shoot, Socket, Conv}, State) ->
+  ?DEBUGLOG("recv connect with conv ~p", [Conv]),
   {noreply, State#state{sock = Socket, conv = Conv}};
-handle_info({kcp_data, Conv, Data}, State = #state{conv = Conv}) ->
-  ?DEBUGLOG("recv data ~p", [Data]),
+handle_info({kcp_data, Conv, DataList}, State = #state{conv = Conv}) ->
+  ?DEBUGLOG("recv data ~p", [DataList]),
   {noreply, State};
 handle_info(_Info, State) ->
   {noreply, State}.

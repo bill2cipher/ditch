@@ -18,6 +18,7 @@
 -define(IBOUND(L, V, M), if V < L -> L; V > M -> M; true -> V end).
 -define(MIN(F, S), case F < S of true -> F; false -> S end).
 -define(MAX(F, S), case F < S of true -> S; false -> F end).
+-define(IF(C, T, F), case C of true -> T; false -> F end).
 
 -define(CONV_START_LIMIT, 500).
 
