@@ -31,8 +31,8 @@
 
 -record(state, {sock :: inet:socket(),
   callback :: any(),
-  cb_pid :: pid(),
-  next_conv :: non_neg_integer()}).
+  cb_opts :: list(),
+  cb_args :: list()}).
 
 %%%===================================================================
 %%% API
@@ -40,16 +40,8 @@
 name() ->
   ditch_kcp.
 
-send_data(KCP = #kcp_pcb{mss = Mss}, Data) ->
-  DataList = util:binary_split(Data, Mss),
-  send_data2(KCP, DataList, length(DataList) - 1).
-
-send_data2(KCP, [], 0) -> KCP;
-send_data2(KCP = #kcp_pcb{snd_queue = SndQue}, [Data | Left], Frg) ->
-  Seg = #kcp_seg{len = byte_size(Data), frg = Frg, data = Data},
-  SndQue2 = ditch_queue:in(Seg, SndQue),
-  KCP2 = KCP#kcp_pcb{snd_queue = SndQue2},
-  send_data2(KCP2, Left, Frg - 1).
+send_data(#kcp_ref{pid = PID, key = Key}, Data) ->
+  PID ! {kcp_send, Key, Data}.
 
 
 %%--------------------------------------------------------------------
@@ -86,13 +78,10 @@ init([DitchOpts, Callback, CallbackOpts, Args]) ->
       ?ERRORLOG("open kcp listener failed, reason ~p", [Reason]),
       {stop, Reason};
     {ok, Socket} ->
-      case Callback:start_link(CallbackOpts, Args) of
-        {ok, PID} ->
-          timer:send_after(?KCP_INTERVAL, self(), kcp_update),
-          {ok, #state{sock = Socket, callback = Callback, cb_pid = PID, next_conv = rand_num:next(?CONV_START_LIMIT)}};
-        {stop, Reason} ->
-          {stop, Reason}
-      end
+      {ok, Port} = inet:port(Socket),
+      ?DEBUGLOG("init udp sock with port ~p", [Port]),
+      timer:send_after(?KCP_INTERVAL, self(), kcp_update),
+      {ok, #state{sock = Socket, callback = Callback, cb_opts = CallbackOpts, cb_args = Args}}
   end.
 
 %%--------------------------------------------------------------------
@@ -142,27 +131,25 @@ handle_cast(_Request, State) ->
   {noreply, NewState :: #state{}, timeout() | hibernate} |
   {stop, Reason :: term(), NewState :: #state{}}).
 %% stop when proc process terminate
-handle_info({'EXIT', From, Reason}, State = #state{cb_pid = From}) ->
-  {stop, {cb_terminate, Reason}, State};
+handle_info({'EXIT', _From, Reason}, State) ->
+  ?ERRORLOG("callback module exit with reason ~p", [Reason]),
+  {noreply, State};
 
 %% change into active when no more active for stream change
 handle_info({udp_passive, Socket}, State = #state{sock = Socket}) ->
-  inet:setopts(Socket, {active, 10}),
+  inet:setopts(Socket, [{active, 10}]),
   {noreply, State};
 
 %% New Data arrived
 handle_info({udp, Socket, IP, InPortNo, Packet}, State = #state{sock = Socket}) ->
-  ?DEBUGLOG("rcv data from ~p", [{IP, InPortNo}]),
   case try_handle_pkg(IP, InPortNo, Packet, State) of
     {ok, State2} ->
-      ?DEBUGLOG("handle kcp pkg success"),
       {noreply, State2};
     {stop, Reason, State2} ->
-      ?ERRORLOG("stoping kcp handler, reason ~w", [Reason]),
+      ?ERRORLOG("stoping kcp handler, reason ~p", [Reason]),
       {stop, Reason, State2};
     {error, Reason, State2} ->
-      ?ERRORLOG("handle kcp pkg failed, reason ~w", [Reason]),
-      dump_kcp(get({IP, InPortNo})),
+      ?ERRORLOG("handle kcp pkg failed, reason ~p", [Reason]),
       {noreply, State2}
   end;
 
@@ -177,8 +164,18 @@ handle_info(kcp_update, State) ->
   timer:send_after(?KCP_INTERVAL, self(), kcp_update),
   {noreply, State};
 
+handle_info({kcp_send, Key, Data}, State) when is_binary(Data) ->
+  case get(Key) of
+    undefined -> {noreply, State};
+    KCP = #kcp_pcb{mss = Mss} ->
+      DataList = util:binary_split(Data, Mss),
+      KCP2 = kcp_send(KCP, DataList, length(DataList)),
+      put(Key, KCP2),
+      {noreply, State}
+  end;
+
 handle_info(Info, State) ->
-  ?ERRORLOG("receiving unknown info[~w]", [Info]),
+  ?ERRORLOG("receiving unknown info[~p]", [Info]),
   {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -235,13 +232,13 @@ handle_recv_pkg(IP, Port, Data, State) ->
   Args = {undefined, undefined},
   OldKCP = get({IP, Port}),
   case handle_recv_pkg2(OldKCP, IP, Port, State, Args, Data) of
-    {ok, State2 = #state{cb_pid = RecvPID}} ->
+    {ok, State2} ->
       KCP = get({IP, Port}),
-      KCP2 = check_data_rcv(OldKCP, KCP, RecvPID),
+      KCP2 = check_data_rcv(OldKCP, KCP),
       put({IP, Port}, KCP2),
       {ok, State2};
     {error, Reason, State2} ->
-      ?ERRORLOG("proc kcp packag failed, reason [~w]", [Reason]),
+      ?ERRORLOG("proc kcp packag failed, reason [~p]", [Reason]),
       {error, Reason, State2};
     {stop, Reason, State2} -> {stop, Reason, State2}
   end.
@@ -261,20 +258,22 @@ handle_recv_pkg2(KCP, IP, Port, State, {MaxAck, Una}, <<>>) ->
 handle_recv_pkg2(KCP, IP, Port, State, {MaxAck, _},
     ?KCP_SEG(Conv, ?KCP_CMD_PUSH, Frg, Wnd, Ts, Sn, Una, Len, Data, Left)) ->
   case KCP of
-    undefined when Conv =/= 0 ->
-      {error, "first kcp package conv not zero", State};
+    undefined when Conv =:= 0 ->
+      {error, "first kcp package conv is zero", State};
     #kcp_pcb{conv = KConv} when Conv =/= KConv ->
       ?ERRORLOG("conv id not match ~p/~p", [KConv, Conv]),
       {error, "conv id not match"};
     _ ->
       {KCP2, State2} = case KCP of
         undefined ->
-          #state{next_conv = NextConv, cb_pid = RecvPID, sock = Socket} = State,
-          PCB = #kcp_pcb{conv = NextConv, key = {IP, Port}, state = ?KCP_STATE_ACTIVE,
-            rmt_wnd = Wnd, probe = ?KCP_SYNC_ACK_SEND},
-          put({IP, Port}, PCB),
-          RecvPID ! {shoot, Socket, NextConv},
-          {PCB, State#state{next_conv = NextConv + 1}};
+          Key = {IP, Port},
+          #state{sock = Socket, callback = Callback, cb_opts = CallbackOpts, cb_args = Args} = State,
+          {ok, RecvPID} = Callback:start_link(CallbackOpts, Args),
+          PCB = #kcp_pcb{conv = Conv, key = Key, state = ?KCP_STATE_ACTIVE,
+            rmt_wnd = Wnd, probe = ?KCP_SYNC_ACK_SEND, pid = RecvPID},
+          put(Key, PCB),
+          RecvPID ! {shoot, Socket, Conv, #kcp_ref{pid = self(), key = Key}},
+          {PCB, State};
         PCB -> {PCB, State}
       end,
       KCP3 = kcp_parse_una(KCP2#kcp_pcb{rmt_wnd = Wnd}, Una),
@@ -514,12 +513,12 @@ check_and_move2(RcvNxt, Prev, Idx, RcvBuf, RcvQueue) ->
     _ -> {RcvNxt, RcvBuf, RcvQueue}
   end.
 
-check_data_rcv(OldKCP, KCP, RecvPID) ->
-  #kcp_pcb{rcv_queue = OldQue} = OldKCP,
+check_data_rcv(OldKCP, KCP) ->
+  OldLen = ?IF(OldKCP =:= undefined, 0, ditch_queue:len(OldKCP#kcp_pcb.rcv_queue)),
   #kcp_pcb{rcv_queue = RcvQue, probe = Probe, rcv_nxt = RcvNxt, rcv_buf = RcvBuf,
-    rcv_wnd = RcvWnd} = KCP,
+    rcv_wnd = RcvWnd, pid = RecvPID} = KCP,
   Recover = ditch_queue:len(RcvQue) >= RcvWnd,
-  case ditch_queue:len(OldQue) =:= ditch_queue:len(RcvQue) of
+  case OldLen =:= ditch_queue:len(RcvQue) of
     true  -> KCP;
     false ->
       {RcvQue2, DataList} = check_data_rcv2(RcvQue, [], []),
@@ -570,8 +569,7 @@ kcp_update(Now, Socket, KCP) ->
 %% Flush all data into the internet
 kcp_flush(_Socket, KCP = #kcp_pcb{updated = false}) -> KCP;
 kcp_flush(Socket, KCP) ->
-  #kcp_pcb{conv = Conv, rcv_nxt = RcvNxt, rcv_queue = RcvQue, rcv_wnd = RWnd,
-    rx_rto = Rto} = KCP,
+  #kcp_pcb{conv = Conv, rcv_nxt = RcvNxt, rcv_queue = RcvQue, rcv_wnd = RWnd} = KCP,
   Wnd = ?IF(ditch_queue:len(RcvQue) < RWnd, RWnd - ditch_queue:len(RcvQue), 0),
   Seg = #kcp_seg{conv = Conv, cmd = ?KCP_CMD_ACK, frg = 0, wnd = Wnd, una = RcvNxt,
     ts = 0, sn = 0, len = 0},
@@ -585,17 +583,17 @@ kcp_flush(Socket, KCP) ->
   KCP5.
 
 kcp_flush_ack(Socket, KCP = #kcp_pcb{key = Key, acklist = AckList, mtu = Mtu}, Seg) ->
-  Buf = kcp_flush_ack2(Socket, Key, Seg, AckList, [], 0, Mtu),
+  Buf = kcp_flush_ack2(Socket, Key, Seg, AckList, {[], 0}, Mtu),
   {KCP#kcp_pcb{acklist = []}, Buf}.
-kcp_flush_ack2(_Socket, _Key, _Seg, [], Buf, Size, _Limit) -> {Buf, Size};
-kcp_flush_ack2(Socket, Key, Seg, [{Sn, Ts} | Left], Buf, Size, Limit) ->
+kcp_flush_ack2(_Socket, _Key, _Seg, [], Buf, _Limit) -> Buf;
+kcp_flush_ack2(Socket, Key, Seg, [{Sn, Ts} | Left], Buf, Limit) ->
   #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
   Bin = ?KCP_SEG(Conv, ?KCP_CMD_ACK, 0, Wnd, Ts, Sn, Una, 0, <<>>, <<>>),
-  {Buf2, Size2} = kcp_output(Socket, Key, Bin, Buf, Size, Limit),
-  kcp_flush_ack2(Socket, Key, Seg, Left, Buf2, Size2, Limit).
+  Buf2 = kcp_output(Socket, Key, Bin, Buf, Limit),
+  kcp_flush_ack2(Socket, Key, Seg, Left, Buf2, Limit).
 
 %% Do not implement wnd probe right now
-kcp_probe_wnd(Socket, KCP, Seg, {Buf, Size}) ->
+kcp_probe_wnd(Socket, KCP, Seg, Buf) ->
   KCP2 = kcp_update_probe(KCP),
   #kcp_pcb{key = Key, probe = Probe, mtu = Mtu} = KCP2,
   #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
@@ -603,7 +601,7 @@ kcp_probe_wnd(Socket, KCP, Seg, {Buf, Size}) ->
     false -> {KCP2, Buf};
     true  ->
       Bin = ?KCP_SEG(Conv, ?KCP_CMD_WASK, 0, Wnd, 0, 0, Una, 0, <<>>, <<>>),
-      Buf2 = kcp_output(Socket, Key, Bin, Buf, Size, Mtu),
+      Buf2 = kcp_output(Socket, Key, Bin, Buf, Mtu),
       {KCP2, Buf2}
   end.
 kcp_update_probe(KCP = #kcp_pcb{rmt_wnd = Rwnd}) when Rwnd =/= 0 ->
@@ -625,45 +623,47 @@ kcp_update_probe(KCP) ->
   end.
 kcp_flush_wnd(_Socket, KCP = #kcp_pcb{probe = Probe}, _Seg, Buf)
     when Probe band ?KCP_ASK_TELL =:= 0 -> {KCP, Buf};
-kcp_flush_wnd(Socket, KCP, Seg, {Buf, Size}) ->
+kcp_flush_wnd(Socket, KCP, Seg, Buf) ->
   #kcp_pcb{key = Key, mtu = Mtu} = KCP,
   #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
   Bin = ?KCP_SEG(Conv, ?KCP_CMD_WINS, 0, Wnd, 0, 0, Una, 0, <<>>, <<>>),
-  Buf2 = kcp_output(Socket, Key, Bin, Buf, Size, Mtu),
+  Buf2 = kcp_output(Socket, Key, Bin, Buf, Mtu),
   {KCP, Buf2}.
 
 
 kcp_flush_data(Socket, KCP, Seg, Buf) ->
   #kcp_pcb{snd_wnd = SWnd, rmt_wnd = RWnd, nocwnd = NoCwnd, cwnd = CWnd,
-    fastresend = FastResend, nodelay = NoDelay, rx_rto = RxRto} = KCP,
+    fastresend = FastResend, nodelay = NoDelay, rx_rto = RxRto, current = Current} = KCP,
   CalWnd = ?MIN(SWnd, RWnd),
   CalWnd2 = ?IF(NoCwnd =:= 0, ?MIN(CWnd, CalWnd), CalWnd),
-  KCP2 = sndque_to_sndbuf(KCP, Seg, CalWnd2),
+  KCP2 = sndque_to_sndbuf(KCP, Seg#kcp_seg{ts = Current, resendts = Current, rto = RxRto}, CalWnd2),
   Resent = ?IF(FastResend > 0, FastResend, 16#FFFFFFFF),
   RtoMin = ?IF(NoDelay == 0, RxRto bsr 3, 0),
-  {KCP3, Buf2} = kcp_flush_data2(Socket, KCP2, Buf, Resent, RtoMin, CalWnd2),
+  Invariant = {Socket, Resent, RtoMin, KCP2, CalWnd2, Seg#kcp_seg.wnd},
+  {KCP3, Buf2} = kcp_flush_data2(Invariant, Buf),
   {KCP3, Buf2}.
 
-kcp_flush_data2(Socket, KCP, Buf, FastResent, RtoMin, CWnd) ->
-  #kcp_pcb{snd_buf = SndBuf} = KCP,
-  {KCP2, Buf2} = kcp_flush_data3(Socket, SndBuf, ditch_buffer:first(SndBuf), FastResent,
-    RtoMin, KCP, Buf, false, false, CWnd),
+kcp_flush_data2(Invariant, Buf) ->
+  {_, _, _, #kcp_pcb{snd_buf = SndBuf}, _, _} = Invariant,
+  {KCP2, Buf2} = kcp_flush_data3(Invariant, SndBuf, ditch_buffer:first(SndBuf), Buf, false, false),
   {KCP2, Buf2}.
 
-kcp_flush_data3(_Socket, SndBuf, ?LAST_INDEX, FastResent, _RtoMin, KCP, Buf, Change, Lost, CalcWnd) ->
+kcp_flush_data3(Invariant, SndBuf, ?LAST_INDEX, Buf, Change, Lost) ->
+  {_, FastResent, _, KCP, CalcWnd, _} = Invariant,
   KCP2 = case Change of
     false -> KCP#kcp_pcb{snd_buf = SndBuf};
     true  ->
-      #kcp_pcb{snd_nxt = SndNxt, snd_una = SndUna, cwnd = CWnd, mss = Mss} = KCP,
+      #kcp_pcb{snd_nxt = SndNxt, snd_una = SndUna, mss = Mss} = KCP,
       Thresh2 = case (SndNxt - SndUna) div 2 of
         V when V < ?KCP_THRESH_MIN -> ?KCP_THRESH_MIN;
         V -> V
       end,
-      KCP#kcp_pcb{snd_buf = SndBuf, cwnd = Thresh2 + FastResent, incr = CWnd * Mss, ssthresh = Thresh2}
+      CWnd2 = Thresh2 + FastResent,
+      KCP#kcp_pcb{snd_buf = SndBuf, cwnd = CWnd2, incr = CWnd2 * Mss, ssthresh = Thresh2}
   end,
   KCP3 = case Lost of
     true ->
-      Thresh3 = lists:max([?KCP_THRESH_MIN, CalcWnd div 2]),
+      Thresh3 = ?MAX(?KCP_THRESH_MIN, CalcWnd div 2),
       KCP2#kcp_pcb{ssthresh = Thresh3, cwnd = 1, incr = KCP2#kcp_pcb.mss};
     false -> KCP2
   end,
@@ -672,28 +672,26 @@ kcp_flush_data3(_Socket, SndBuf, ?LAST_INDEX, FastResent, _RtoMin, KCP, Buf, Cha
     false -> KCP3
   end,
   {KCP4, Buf};
-kcp_flush_data3(Socket, SndBuf, Idx, FastResent, RtoMin, KCP, {Buf, Size}, Change, Lost, CWnd) ->
-  #kcp_pcb{current = Current, rx_rto = Rto, nodelay = NoDelay, mtu = Mtu, key = Key} = KCP,
+kcp_flush_data3(Invariant, SndBuf, Idx, Buf, Change, Lost) ->
+  {Socket, FastResent, RtoMin, KCP, _, SWnd} = Invariant,
+  #kcp_pcb{current = Current, rx_rto = Rto, nodelay = NoDelay, mtu = Mtu, key = Key, rcv_nxt = RcvNxt} = KCP,
   Next = ditch_buffer:next(Idx, SndBuf),
   case ditch_buffer:get_data(Idx, SndBuf) of
     undefined ->
-      kcp_flush_data3(Socket, SndBuf, Next, FastResent, RtoMin, KCP, {Buf, Size}, Change, Lost, CWnd);
+      kcp_flush_data3(Invariant, SndBuf, Next, Buf, Change, Lost);
     Seg = #kcp_seg{xmit = Xmit, resendts = ResentTs, fastack = FastAck, rto = SRto} ->
       {Send, Lost2, Change2, Seg2} = if
         Xmit =:= 0 ->
           S2 = Seg#kcp_seg{xmit = Xmit + 1, rto = Rto, resendts = Current + Rto + RtoMin},
-          {true, false or Lost, false or Change, S2};
+          {true, Lost, Change, S2};
         Current >= ResentTs ->
-          SRto2 = case NoDelay =:= 0 of
-            true  -> SRto + Rto;
-            false -> SRto + Rto div 2
-          end,
+          SRto2 = ?IF(NoDelay =:= 0, SRto + Rto, SRto + Rto div 2),
           S2 = Seg#kcp_seg{xmit = Xmit + 1, rto = SRto2, resendts = Current + SRto2},
-          {true, true or Lost, false or Change, S2};
-        FastAck > FastResent ->
+          {true, true, Change, S2};
+        FastAck >= FastResent ->
           S2 = Seg#kcp_seg{xmit = Xmit + 1, fastack = 0, resendts = Current + Rto},
-          {true, false or Lost, true or Change, S2};
-        true -> {false, false or Lost, false or Change, Seg}
+          {true, Lost, true, S2};
+        true -> {false, Lost, Change, Seg}
       end,
 
       SndBuf2 = case Send of
@@ -702,12 +700,14 @@ kcp_flush_data3(Socket, SndBuf, Idx, FastResent, RtoMin, KCP, {Buf, Size}, Chang
       end,
       case Send =:= true of
         true ->
-          #kcp_seg{conv = Conv, frg = Frg, wnd = Wnd, ts = Ts, sn = Sn, una = Una, len = Len, data = Data} = Seg2,
+          Seg3 = Seg2#kcp_seg{ts = Current, wnd = SWnd, una = RcvNxt},
+          #kcp_seg{conv = Conv, frg = Frg, wnd = Wnd, ts = Ts, sn = Sn, una = Una, len = Len, data = Data} = Seg3,
           Bin = ?KCP_SEG(Conv, ?KCP_CMD_PUSH, Frg, Wnd, Ts, Sn, Una, Len, Data, <<>>),
-          {Buf2, Size2} = kcp_output(Socket, Key, Bin, Buf, Size, Mtu),
-          kcp_flush_data3(Socket, SndBuf2, Next, FastResent, RtoMin, KCP, {Buf2, Size2}, Change2, Lost2, CWnd);
+          Buf2 = kcp_output(Socket, Key, Bin, Buf, Mtu),
+          SndBuf3 = ditch_buffer:set_data(Idx, Seg3, SndBuf2),
+          kcp_flush_data3(Invariant, SndBuf3, Next, Buf2, Change2, Lost2);
         false ->
-          kcp_flush_data3(Socket, SndBuf2, Next, FastResent, RtoMin, KCP, {Buf, Size}, Change2, Lost2, CWnd)
+          kcp_flush_data3(Invariant, SndBuf2, Next, Buf, Change2, Lost2)
       end
   end.
 
@@ -728,8 +728,14 @@ sndque_to_sndbuf2(SndNxt, Limit, Seg, SndQue, SndBuf) ->
   SndBuf2 = ditch_buffer:append_tail(NSeg, SndBuf),
   sndque_to_sndbuf2(SndNxt + 1, Limit, Seg, SndQue2, SndBuf2).
 
+kcp_send(KCP, [], 0) -> KCP;
+kcp_send(KCP = #kcp_pcb{snd_queue = SndQue}, [Data | Left], Frg) ->
+  Seg = #kcp_seg{len = byte_size(Data), frg = Frg - 1, data = Data},
+  SndQue2 = ditch_queue:in(Seg, SndQue),
+  KCP2 = KCP#kcp_pcb{snd_queue = SndQue2},
+  kcp_send(KCP2, Left, Frg - 1).
 
-kcp_output(Socket, Key, Bin, Buf, Size, Limit) ->
+kcp_output(Socket, Key, Bin, {Buf, Size}, Limit) ->
   {Buf2, Size2} = case Size + ?KCP_OVERHEAD > Limit of
     true ->
       Data = util:binary_join(Buf),

@@ -24,12 +24,10 @@ change_prefix(Prefix) ->
   log4erl:change_format(app1, F).
 
 timenow() ->
-  {A, B, _} = os:timestamp(),
-  A * 1000 * 1000 + B.
+  erlang:system_time(seconds).
 
 timenow_mill() ->
-  {A, B, C} = os:timestamp(),
-  (A * 1000000 + B) * 1000 + C / 1000.
+  erlang:system_time(milli_seconds).
 
 get_db_node() ->
   'db_svr@127.0.0.1'.

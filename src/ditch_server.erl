@@ -41,7 +41,6 @@
 start_connection(Ref, Block, Args) ->
   gen_server:call(Ref, {start_connection, Block, Args}).
 
-
 set_listener_sup(PID, SupPID) ->
   gen_server:call(PID, {set_listener_sup, SupPID}).
 %%--------------------------------------------------------------------

@@ -56,8 +56,10 @@
 -record(kcp_buf, {data, index, used = ?LAST_INDEX, free = 0,
   size = 0, unused = 0, tail = ?LAST_INDEX}).
 
--record(kcp_seg, {conv, cmd, frg, wnd, ts, sn, una, len, resendts,
-  rto, fastack, xmit, data}).
+-record(kcp_seg, {conv = 0, cmd = 0, frg = 0, wnd = 0, ts = 0, sn = 0,
+  una = 0, len = 0, resendts = 0, rto = 0, fastack = 0, xmit = 0, data = <<>>}).
+
+-record(kcp_ref, {pid, key}).
 
 -record(kcp_pcb, {
   conv = 0,
@@ -99,7 +101,8 @@
   ackblock = 0,
   fastresend = 0,
   nocwnd = 0,
-  key}).
+  key,
+  pid = undefined}).
 
 -define(KCP_SEG(Conv, Cmd, Frg, Wnd, Ts, Sn, Una, Len, Data, Left),
   <<Conv:32, Cmd:8, Frg:8, Wnd:16, Ts:32, Sn:32, Una:32, Len:32, Data:Len/binary, Left/binary>>).

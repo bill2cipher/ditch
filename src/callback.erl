@@ -13,7 +13,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0]).
+-export([start_link/2]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -25,7 +25,7 @@
 
 -define(SERVER, ?MODULE).
 
--record(state, {sock = undefined, conv = 0}).
+-record(state, {sock = undefined, conv = 0, ref}).
 
 %%%===================================================================
 %%% API
@@ -37,10 +37,11 @@
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec(start_link() ->
-  {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
-start_link() ->
-  gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+-spec(start_link(CbOpts::list(), Args :: list()) ->
+  {ok, Pid :: pid()}).
+start_link(CbOpts, Args) ->
+  ?DEBUGLOG("init callback with ~w ~w", [CbOpts, Args]),
+  gen_server:start_link(?MODULE, [], [{timeout, 100}]).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -109,11 +110,12 @@ handle_cast(_Request, State) ->
   {noreply, NewState :: #state{}} |
   {noreply, NewState :: #state{}, timeout() | hibernate} |
   {stop, Reason :: term(), NewState :: #state{}}).
-handle_info({shoot, Socket, Conv}, State) ->
-  ?DEBUGLOG("recv connect with conv ~p", [Conv]),
-  {noreply, State#state{sock = Socket, conv = Conv}};
-handle_info({kcp_data, Conv, DataList}, State = #state{conv = Conv}) ->
-  ?DEBUGLOG("recv data ~p", [DataList]),
+handle_info({shoot, Socket, Conv, Ref}, State) ->
+  ?DEBUGLOG("~p recv connect with conv ~p", [self(), Conv]),
+  {noreply, State#state{sock = Socket, conv = Conv, ref = Ref}};
+handle_info({kcp_data, Conv, DataList}, State = #state{conv = Conv, ref = Ref}) ->
+  ?DEBUGLOG("~p recv data ~p with conv ~p ~p", [self(), DataList, Conv, Ref]),
+  ditch_kcp:send_data(Ref, hd(DataList)),
   {noreply, State};
 handle_info(_Info, State) ->
   {noreply, State}.
