@@ -37,8 +37,8 @@
 -define(KCP_SYNC_SEND, 4).       %% need to send KCP_CMD_SYNC
 -define(KCP_SYNC_ACK_SEND, 8).   %% need to send KCP_CMD_SYNC_ACK
 
--define(KCP_WND_SND, 32).
--define(KCP_WND_RCV, 32).
+-define(KCP_WND_SND, 128).
+-define(KCP_WND_RCV, 128).
 -define(KCP_MTU_DEF, 1400).
 -define(KCP_ACK_FAST, 3).
 -define(KCP_INTERVAL, 100).
@@ -48,6 +48,8 @@
 -define(KCP_THRESH_MIN, 2).
 -define(KCP_PROBE_INIT, 7000).    %% 7 secs to probe window size
 -define(KCP_PROBE_LIMIT, 120000). %% up to 120 secs to probe window
+
+-define(KCP_UPDATE_INTERVAL, 50).
 
 -define(KCP_STATE_ACTIVE, 1).
 -define(KCP_STATE_DEAD, 0).

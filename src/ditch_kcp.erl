@@ -16,6 +16,7 @@
 %% API
 -export([start_link/4,
   send_data/2,
+  send_datalist/2,
   dump_kcp/1,
   name/0]).
 
@@ -43,6 +44,8 @@ name() ->
 send_data(#kcp_ref{pid = PID, key = Key}, Data) ->
   PID ! {kcp_send, Key, Data}.
 
+send_datalist(#kcp_ref{pid = PID, key = Key}, Datalist) ->
+  PID ! {kcp_send_datalist, Key, Datalist}.
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -80,7 +83,7 @@ init([DitchOpts, Callback, CallbackOpts, Args]) ->
     {ok, Socket} ->
       {ok, Port} = inet:port(Socket),
       ?DEBUGLOG("init udp sock with port ~p", [Port]),
-      timer:send_after(?KCP_INTERVAL, self(), kcp_update),
+      timer:send_after(?KCP_UPDATE_INTERVAL, self(), kcp_update),
       {ok, #state{sock = Socket, callback = Callback, cb_opts = CallbackOpts, cb_args = Args}}
   end.
 
@@ -161,7 +164,7 @@ handle_info(kcp_update, State) ->
      KCP2 = kcp_update(Now, State#state.sock, KCP),
      put(Key, KCP2)
    end || {Key, KCP} <- Keys, is_record(KCP, kcp_pcb)],
-  timer:send_after(?KCP_INTERVAL, self(), kcp_update),
+  timer:send_after(?KCP_UPDATE_INTERVAL, self(), kcp_update),
   {noreply, State};
 
 handle_info({kcp_send, Key, Data}, State) when is_binary(Data) ->
@@ -170,6 +173,19 @@ handle_info({kcp_send, Key, Data}, State) when is_binary(Data) ->
     KCP = #kcp_pcb{mss = Mss} ->
       DataList = util:binary_split(Data, Mss),
       KCP2 = kcp_send(KCP, DataList, length(DataList)),
+      put(Key, KCP2),
+      {noreply, State}
+  end;
+
+handle_info({kcp_send_datalist, Key, Datalist}, State) when is_list(Datalist) ->
+  case get(Key) of
+    undefined -> {noreply, State};
+    KCP = #kcp_pcb{mss = Mss} ->
+      SndFun = fun(Data, PCB) ->
+        DL = util:binary_split(Data, Mss),
+        kcp_send(PCB, DL, length(DL))
+      end,
+      KCP2 = lists:foldl(SndFun, KCP, Datalist),
       put(Key, KCP2),
       {noreply, State}
   end;
@@ -523,7 +539,7 @@ check_data_rcv(OldKCP, KCP) ->
     false ->
       {RcvQue2, DataList} = check_data_rcv2(RcvQue, [], []),
       {RcvNxt2, RcvBuf2, RcvQue3} = check_and_move(RcvNxt, RcvBuf, RcvQue2),
-      RecvPID ! {kcp_data, KCP#kcp_pcb.conv, DataList},
+      ?IF(DataList =:= [], ignore, RecvPID ! {kcp_data, KCP#kcp_pcb.conv, DataList}),
       Probe2 = ?IF(Recover and (ditch_queue:len(RcvQue3) < RcvWnd), Probe bor ?KCP_ASK_TELL, Probe),
       KCP#kcp_pcb{rcv_nxt = RcvNxt2, rcv_queue = RcvQue3, rcv_buf = RcvBuf2, probe = Probe2}
   end.
@@ -753,7 +769,7 @@ kcp_output2(Socket, {IP, Port}, Data) ->
   case gen_udp:send(Socket, IP, Port, Data) of
     ok -> ok;
     {error, Reason} ->
-      ?ERRORLOG("send udp data to ~p failed with reason ~p", [{IP, Port}, Reason]),
+      ?ERRORLOG("send udp data to ~p failed with reason ~p ~p", [{IP, Port}, Reason, size(Data)]),
       {error, Reason}
   end.
 

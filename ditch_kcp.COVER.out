@@ -1,0 +1,785 @@
+File generated from /home/dgame/workspace/ditch/src/ditch_kcp.erl by COVER 2016-11-01 at 17:29:23
+
+****************************************************************************
+
+        |  %%%-------------------------------------------------------------------
+        |  %%% @author jacky
+        |  %%% @copyright (C) 2016, <COMPANY>
+        |  %%% @doc
+        |  %%%
+        |  %%% @end
+        |  %%% Created : 07. 七月 2016 15:36
+        |  %%%-------------------------------------------------------------------
+        |  -module(ditch_kcp).
+        |  -author("jacky").
+        |  
+        |  -behaviour(gen_server).
+        |  -include("include/ditch.hrl").
+        |  -include_lib("kernel/src/inet_int.hrl").
+        |  
+        |  %% API
+        |  -export([start_link/4,
+        |    send_data/2,
+        |    dump_kcp/1,
+        |    name/0]).
+        |  
+        |  %% gen_server callbacks
+        |  -export([init/1,
+        |    handle_call/3,
+        |    handle_cast/2,
+        |    handle_info/2,
+        |    terminate/2,
+        |    code_change/3]).
+        |  
+        |  -define(SERVER, ?MODULE).
+        |  
+        |  -record(state, {sock :: inet:socket(),
+        |    callback :: any(),
+        |    cb_opts :: list(),
+        |    cb_args :: list()}).
+        |  
+        |  %%%===================================================================
+        |  %%% API
+        |  %%%===================================================================
+        |  name() ->
+     0..|    ditch_kcp.
+        |  
+        |  send_data(#kcp_ref{pid = PID, key = Key}, Data) ->
+     0..|    PID ! {kcp_send, Key, Data}.
+        |  
+        |  
+        |  %%--------------------------------------------------------------------
+        |  %% @doc
+        |  %% Starts the server
+        |  %%
+        |  %% @end
+        |  %%--------------------------------------------------------------------
+        |  -spec(start_link(DitchOpts :: any(), Callback :: module(), Callback :: any(), Args::any()) ->
+        |    {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
+        |  start_link(DitchOpts, Callback, CallbackOpts, Args) ->
+     1..|    gen_server_boot:start_link(?MODULE, [DitchOpts, Callback, CallbackOpts, Args], []).
+        |  
+        |  %%%===================================================================
+        |  %%% gen_server callbacks
+        |  %%%===================================================================
+        |  
+        |  %%--------------------------------------------------------------------
+        |  %% @private
+        |  %% @doc
+        |  %% Initializes the server
+        |  %%
+        |  %% @spec init(Args) -> {ok, State} |
+        |  %%                     {ok, State, Timeout} |
+        |  %%                     ignore |
+        |  %%                     {stop, Reason}
+        |  %% @end
+        |  %%--------------------------------------------------------------------
+        |  init([DitchOpts, Callback, CallbackOpts, Args]) ->
+     1..|    UDPOpts = proplists:get_value(udp_opts, DitchOpts, ?UDP_SOCK_OPTS),
+     1..|    erlang:process_flag(trap_exit, true),
+     1..|    case gen_udp:open(0, UDPOpts) of
+        |      {error, Reason} ->
+     0..|        ?ERRORLOG("open kcp listener failed, reason ~p", [Reason]),
+     0..|        {stop, Reason};
+        |      {ok, Socket} ->
+     1..|        {ok, Port} = inet:port(Socket),
+     1..|        ?DEBUGLOG("init udp sock with port ~p", [Port]),
+     1..|        timer:send_after(?KCP_INTERVAL, self(), kcp_update),
+     1..|        {ok, #state{sock = Socket, callback = Callback, cb_opts = CallbackOpts, cb_args = Args}}
+        |    end.
+        |  
+        |  %%--------------------------------------------------------------------
+        |  %% @private
+        |  %% @doc
+        |  %% Handling call messages
+        |  %%
+        |  %% @end
+        |  %%--------------------------------------------------------------------
+        |  -spec(handle_call(Request :: term(), From :: {pid(), Tag :: term()},
+        |      State :: #state{}) ->
+        |    {reply, Reply :: term(), NewState :: #state{}} |
+        |    {reply, Reply :: term(), NewState :: #state{}, timeout() | hibernate} |
+        |    {noreply, NewState :: #state{}} |
+        |    {noreply, NewState :: #state{}, timeout() | hibernate} |
+        |    {stop, Reason :: term(), Reply :: term(), NewState :: #state{}} |
+        |    {stop, Reason :: term(), NewState :: #state{}}).
+        |  handle_call(_Request, _From, State) ->
+     0..|    {reply, ok, State}.
+        |  
+        |  %%--------------------------------------------------------------------
+        |  %% @private
+        |  %% @doc
+        |  %% Handling cast messages
+        |  %%
+        |  %% @end
+        |  %%--------------------------------------------------------------------
+        |  -spec(handle_cast(Request :: term(), State :: #state{}) ->
+        |    {noreply, NewState :: #state{}} |
+        |    {noreply, NewState :: #state{}, timeout() | hibernate} |
+        |    {stop, Reason :: term(), NewState :: #state{}}).
+        |  handle_cast(_Request, State) ->
+     0..|    {noreply, State}.
+        |  
+        |  %%--------------------------------------------------------------------
+        |  %% @private
+        |  %% @doc
+        |  %% Handling all non call/cast messages
+        |  %%
+        |  %% @spec handle_info(Info, State) -> {noreply, State} |
+        |  %%                                   {noreply, State, Timeout} |
+        |  %%                                   {stop, Reason, State}
+        |  %% @end
+        |  %%--------------------------------------------------------------------
+        |  -spec(handle_info(Info :: timeout() | term(), State :: #state{}) ->
+        |    {noreply, NewState :: #state{}} |
+        |    {noreply, NewState :: #state{}, timeout() | hibernate} |
+        |    {stop, Reason :: term(), NewState :: #state{}}).
+        |  %% stop when proc process terminate
+        |  handle_info({'EXIT', _From, Reason}, State) ->
+     0..|    ?ERRORLOG("callback module exit with reason ~p", [Reason]),
+     0..|    {noreply, State};
+        |  
+        |  %% change into active when no more active for stream change
+        |  handle_info({udp_passive, Socket}, State = #state{sock = Socket}) ->
+     3..|    inet:setopts(Socket, [{active, 10}]),
+     3..|    {noreply, State};
+        |  
+        |  %% New Data arrived
+        |  handle_info({udp, Socket, IP, InPortNo, Packet}, State = #state{sock = Socket}) ->
+    32..|    case try_handle_pkg(IP, InPortNo, Packet, State) of
+        |      {ok, State2} ->
+    32..|        {noreply, State2};
+        |      {stop, Reason, State2} ->
+     0..|        ?ERRORLOG("stoping kcp handler, reason ~p", [Reason]),
+     0..|        {stop, Reason, State2};
+        |      {error, Reason, State2} ->
+     0..|        ?ERRORLOG("handle kcp pkg failed, reason ~p", [Reason]),
+     0..|        {noreply, State2}
+        |    end;
+        |  
+        |  %% Flush all datas
+        |  handle_info(kcp_update, State) ->
+   189..|    Keys = erlang:get(),
+   189..|    Now = util:timenow_mill(),
+   189..|    [begin
+   173..|       KCP2 = kcp_update(Now, State#state.sock, KCP),
+   173..|       put(Key, KCP2)
+   189..|     end || {Key, KCP} <- Keys, is_record(KCP, kcp_pcb)],
+   189..|    timer:send_after(?KCP_INTERVAL, self(), kcp_update),
+   189..|    {noreply, State};
+        |  
+        |  handle_info({kcp_send, Key, Data}, State) when is_binary(Data) ->
+     0..|    case get(Key) of
+     0..|      undefined -> {noreply, State};
+        |      KCP = #kcp_pcb{mss = Mss} ->
+     0..|        DataList = util:binary_split(Data, Mss),
+     0..|        KCP2 = kcp_send(KCP, DataList, length(DataList)),
+     0..|        put(Key, KCP2),
+     0..|        {noreply, State}
+        |    end;
+        |  
+        |  handle_info(Info, State) ->
+     0..|    ?ERRORLOG("receiving unknown info[~p]", [Info]),
+     0..|    {noreply, State}.
+        |  
+        |  %%--------------------------------------------------------------------
+        |  %% @private
+        |  %% @doc
+        |  %% This function is called by a gen_server when it is about to
+        |  %% terminate. It should be the opposite of Module:init/1 and do any
+        |  %% necessary cleaning up. When it returns, the gen_server terminates
+        |  %% with Reason. The return value is ignored.
+        |  %%
+        |  %% @spec terminate(Reason, State) -> void()
+        |  %% @end
+        |  %%--------------------------------------------------------------------
+        |  -spec(terminate(Reason :: (normal | shutdown | {shutdown, term()} | term()),
+        |      State :: #state{}) -> term()).
+        |  terminate(_Reason, _State) ->
+     0..|    ok.
+        |  
+        |  %%--------------------------------------------------------------------
+        |  %% @private
+        |  %% @doc
+        |  %% Convert process state when code is changed
+        |  %%
+        |  %% @spec code_change(OldVsn, State, Extra) -> {ok, NewState}
+        |  %% @end
+        |  %%--------------------------------------------------------------------
+        |  -spec(code_change(OldVsn :: term() | {down, term()}, State :: #state{},
+        |      Extra :: term()) ->
+        |    {ok, NewState :: #state{}} | {error, Reason :: term()}).
+        |  code_change(_OldVsn, State, _Extra) ->
+     0..|    {ok, State}.
+        |  
+        |  %%%===================================================================
+        |  %%% Internal functions
+        |  %%%===================================================================
+        |  
+        |  
+        |  %%--------------------------------------------------------------------
+        |  %% @private
+        |  %% @doc
+        |  %% KCP related logic
+        |  %%--------------------------------------------------------------------
+        |  try_handle_pkg(IP, Port, Data, State) ->
+    32..|    try
+    32..|      handle_recv_pkg(IP, Port, Data, State)
+        |    catch
+        |      Error: Reason ->
+     0..|        Stack = erlang:get_stacktrace(),
+     0..|        ?ERRORLOG("Error occurs while processing udp package ~p", [Stack]),
+     0..|        {error, {Error, Reason}, State}
+        |    end.
+        |  
+        |  handle_recv_pkg(IP, Port, Data, State) ->
+    32..|    Args = {undefined, undefined},
+    32..|    OldKCP = get({IP, Port}),
+    32..|    case handle_recv_pkg2(OldKCP, IP, Port, State, Args, Data) of
+        |      {ok, State2} ->
+    32..|        KCP = get({IP, Port}),
+    32..|        KCP2 = check_data_rcv(OldKCP, KCP),
+    32..|        put({IP, Port}, KCP2),
+    32..|        {ok, State2};
+        |      {error, Reason, State2} ->
+     0..|        ?ERRORLOG("proc kcp packag failed, reason [~p]", [Reason]),
+     0..|        {error, Reason, State2};
+     0..|      {stop, Reason, State2} -> {stop, Reason, State2}
+        |    end.
+        |  
+        |  %% No more data need to be processed.
+        |  handle_recv_pkg2(KCP, IP, Port, State, {MaxAck, Una}, <<>>) ->
+    32..|    case KCP of
+        |      undefined ->
+     0..|        {error, empty_data, State};
+        |      #kcp_pcb{} ->
+    32..|        KCP2 = kcp_rcv_finish(KCP, MaxAck, Una),
+    32..|        put({IP, Port}, KCP2),
+    32..|        {ok, State}
+        |    end;
+        |  
+        |  %% Sync message recved
+        |  handle_recv_pkg2(KCP, IP, Port, State, {MaxAck, _},
+        |      ?KCP_SEG(Conv, ?KCP_CMD_PUSH, Frg, Wnd, Ts, Sn, Una, Len, Data, Left)) ->
+    32..|    case KCP of
+        |      undefined when Conv =:= 0 ->
+     0..|        {error, "first kcp package conv is zero", State};
+        |      #kcp_pcb{conv = KConv} when Conv =/= KConv ->
+     0..|        ?ERRORLOG("conv id not match ~p/~p", [KConv, Conv]),
+     0..|        {error, "conv id not match"};
+        |      _ ->
+    32..|        {KCP2, State2} = case KCP of
+        |          undefined ->
+     1..|            Key = {IP, Port},
+     1..|            #state{sock = Socket, callback = Callback, cb_opts = CallbackOpts, cb_args = Args} = State,
+     1..|            {ok, RecvPID} = Callback:start_link(CallbackOpts, Args),
+     1..|            PCB = #kcp_pcb{conv = Conv, key = Key, state = ?KCP_STATE_ACTIVE,
+        |              rmt_wnd = Wnd, probe = ?KCP_SYNC_ACK_SEND, pid = RecvPID},
+     1..|            put(Key, PCB),
+     1..|            RecvPID ! {shoot, Socket, Conv, #kcp_ref{pid = self(), key = Key}},
+     1..|            {PCB, State};
+    31..|          PCB -> {PCB, State}
+        |        end,
+    32..|        KCP3 = kcp_parse_una(KCP2#kcp_pcb{rmt_wnd = Wnd}, Una),
+    32..|        KCP4 = kcp_shrink_buf(KCP3),
+    32..|        case Sn < (KCP4#kcp_pcb.rcv_nxt + KCP4#kcp_pcb.rcv_wnd) of
+     0..|          false -> handle_recv_pkg2(KCP4, IP, Port, State2, {MaxAck, Una}, Left);
+        |          true  ->
+    32..|            KCP5 = kcp_ack_push(KCP4, Sn, Ts),
+    32..|            KCP6 = case Sn >= KCP5#kcp_pcb.rcv_nxt of
+     0..|              false -> KCP5;
+        |              true  ->
+    32..|                Seg = #kcp_seg{conv = Conv, cmd = ?KCP_CMD_PUSH, wnd = Wnd, frg = Frg, ts = Ts, sn = Sn, una = Una, len = Len, data = Data},
+    32..|                kcp_parse_data(KCP5, Seg)
+        |            end,
+    32..|            handle_recv_pkg2(KCP6, IP, Port, State2, {MaxAck, Una}, Left)
+        |        end
+        |    end;
+        |  
+        |  handle_recv_pkg2(KCP, IP, Port, State, {MaxAck, _},
+        |      ?KCP_SEG(Conv, ?KCP_CMD_ACK, 0, Wnd, Ts, Sn, Una, 0, _Data, Left)) ->
+     0..|    case KCP of
+        |      undefined ->
+     0..|        ?ERRORLOG("recv unconnected ack seg from ~p", [{IP, Port}]),
+     0..|        {error, "cound not find kcp"};
+        |      #kcp_pcb{conv = KConv} when Conv =/= KConv ->
+     0..|        ?ERRORLOG("conv id not match ~p/~p", [KConv, Conv]),
+     0..|        {error, "conv id not match"};
+        |      #kcp_pcb{} ->
+     0..|        KCP2 = kcp_parse_una(KCP#kcp_pcb{rmt_wnd = Wnd}, Una),
+     0..|        KCP3 = kcp_shrink_buf(KCP2),
+     0..|        KCP4 = kcp_update_ack(KCP3, KCP3#kcp_pcb.current - Ts),
+     0..|        KCP5 = kcp_parse_ack(KCP4, Sn),
+     0..|        KCP6 = kcp_shrink_buf(KCP5),
+     0..|        MaxAck2 = case MaxAck of
+     0..|          undefined -> Sn;
+     0..|          MaxAck when Sn > MaxAck -> Sn;
+     0..|          MaxAck -> MaxAck
+        |        end,
+     0..|        handle_recv_pkg2(KCP6, IP, Port, State, {MaxAck2, Una}, Left)
+        |    end;
+        |  
+        |  handle_recv_pkg2(KCP, IP, Port, State, {MaxAck, _},
+        |      ?KCP_SEG(Conv, ?KCP_CMD_WASK, 0, Wnd, _Ts, _Sn, Una, 0, _Data, Left)) ->
+     0..|    case KCP of
+        |      undefined ->
+     0..|        {error, "cound not find kcp"};
+        |      #kcp_pcb{conv = KConv} when KConv =/= Conv ->
+     0..|        {error, "conv id not match"};
+        |      #kcp_pcb{} ->
+     0..|        KCP2 = kcp_parse_una(KCP#kcp_pcb{rmt_wnd = Wnd}, Una),
+     0..|        KCP3 = kcp_shrink_buf(KCP2),
+     0..|        KCP4 = KCP3#kcp_pcb{probe = KCP3#kcp_pcb.probe bor ?KCP_ASK_TELL},
+     0..|        handle_recv_pkg2(KCP4, IP, Port, State, {MaxAck, Una}, Left)
+        |    end;
+        |  
+        |  handle_recv_pkg2(KCP, IP, Port, State, {MaxAck, _},
+        |      ?KCP_SEG(Conv, ?KCP_CMD_WINS, 0, Wnd, _Ts, _Sn, Una, 0, _Data, Left)) ->
+     0..|    case KCP of
+        |      undefined ->
+     0..|        {error, "cound not find kcp"};
+        |      #kcp_pcb{conv = KConv} when KConv =/= Conv ->
+     0..|        {error, "conv id not match"};
+        |      #kcp_pcb{} ->
+     0..|        KCP2 = kcp_parse_una(KCP#kcp_pcb{rmt_wnd = Wnd}, Una),
+     0..|        KCP3 = kcp_shrink_buf(KCP2),
+     0..|        handle_recv_pkg2(KCP3, IP, Port, State, {MaxAck, Una}, Left)
+        |    end;
+        |  
+        |  handle_recv_pkg2(KCP, IP, Port, _State, _MaxAck, _Data) ->
+     0..|    ?ERRORLOG("recv unknown data ~p segment from ~p for pcb", [_Data, {IP, Port}, KCP]),
+     0..|    {error, "unknown pkg format"}.
+        |  
+        |  
+        |  %% Increase FaskAck count for each segment
+        |  kcp_parse_fastack(KCP = #kcp_pcb{snd_una = SndUna, snd_nxt = SndNxt}, Sn)
+     0..|      when SndUna > Sn; Sn >= SndNxt -> KCP;
+        |  kcp_parse_fastack(KCP, Sn) ->
+     0..|    FirstIdx = ditch_buffer:first(KCP#kcp_pcb.snd_buf),
+     0..|    SndBuf2 = kcp_parse_fastack2(KCP#kcp_pcb.snd_buf, FirstIdx, Sn),
+     0..|    KCP#kcp_pcb{snd_buf = SndBuf2}.
+        |  
+     0..|  kcp_parse_fastack2(SndBuf, ?LAST_INDEX, _) -> SndBuf;
+        |  kcp_parse_fastack2(SndBuf, Idx, Sn) ->
+     0..|    case ditch_buffer:get_data(Idx, SndBuf) of
+        |      undefined ->
+     0..|        Next = ditch_buffer:next(SndBuf, Idx),
+     0..|        kcp_parse_fastack2(SndBuf, Next, Sn);
+        |      Seg when Seg#kcp_seg.sn > Sn ->
+     0..|        kcp_parse_fastack2(SndBuf, ?LAST_INDEX, Sn);
+        |      Seg = #kcp_seg{fastack = FastAck} ->
+     0..|        Seg2 = Seg#kcp_seg{fastack = FastAck + 1},
+     0..|        SndBuf2 = ditch_buffer:set_data(Idx, Seg2, SndBuf),
+     0..|        Next = ditch_buffer:next(SndBuf2, Idx),
+     0..|        kcp_parse_fastack2(SndBuf2, Next, Sn)
+        |    end.
+        |  
+        |  %% update kcp rx_rttval, rx_srtt and rx_rto
+     0..|  kcp_update_ack(KCP, RTT) when RTT < 0 -> KCP;
+        |  kcp_update_ack(KCP, RTT) ->
+     0..|    KCP2 = case KCP#kcp_pcb.rx_srtt =:= 0 of
+        |      true ->
+     0..|        KCP#kcp_pcb{rx_srtt = RTT, rx_rttval = RTT div 2};
+        |      false ->
+     0..|        Delta = RTT - KCP#kcp_pcb.rx_srtt,
+     0..|        Delta2 = ?IF(Delta < 0, -Delta, Delta),
+     0..|        RxRttVal = (3 * KCP#kcp_pcb.rx_rttval + Delta2) div 4,
+     0..|        RxSRttVal = (7 * KCP#kcp_pcb.rx_srtt + RTT) div 8,
+     0..|        RxSRttVal2 = ?IF(RxSRttVal < 1, 1, RxSRttVal),
+     0..|        KCP#kcp_pcb{rx_srtt = RxSRttVal2, rx_rttval = RxRttVal}
+        |    end,
+     0..|    Rto = KCP2#kcp_pcb.rx_srtt + lists:max([1, 4 * KCP2#kcp_pcb.rx_rttval]),
+     0..|    Rto2 = ?IBOUND(KCP2#kcp_pcb.rx_minrto, Rto, ?KCP_RTO_MAX),
+     0..|    KCP2#kcp_pcb{rx_rto = Rto2}.
+        |  
+        |  %% recalculate the snd_una
+        |  kcp_shrink_buf(KCP) ->
+    32..|    #kcp_pcb{snd_buf = SndBuf, snd_nxt = SndNxt} = KCP,
+    32..|    case ditch_buffer:first(SndBuf) of
+    32..|      ?LAST_INDEX -> KCP#kcp_pcb{snd_una = SndNxt};
+        |      Idx ->
+     0..|        Seg = ditch_buffer:get_data(Idx, SndBuf),
+     0..|        KCP#kcp_pcb{snd_una = Seg#kcp_seg.sn}
+        |    end.
+        |  
+        |  %% Erase acked seg from snd_buf
+        |  kcp_parse_ack(KCP = #kcp_pcb{snd_una = SndUna, snd_nxt = SndNxt}, Sn)
+        |      when SndUna > Sn; SndNxt =< Sn ->
+     0..|    KCP;
+        |  kcp_parse_ack(KCP, Sn) ->
+     0..|    First = ditch_buffer:first(KCP#kcp_pcb.snd_buf),
+     0..|    SndBuf2 = kcp_parse_ack2(KCP#kcp_pcb.snd_buf, First, ?LAST_INDEX, Sn),
+     0..|    KCP#kcp_pcb{snd_buf = SndBuf2}.
+        |  
+     0..|  kcp_parse_ack2(SndBuf, ?LAST_INDEX, _, _) -> SndBuf;
+        |  kcp_parse_ack2(SndBuf, Idx, Prev, Sn) ->
+     0..|    {Next2, SndBuf2} = case ditch_buffer:get_data(Idx, SndBuf) of
+        |      undefined ->
+     0..|        Next = ditch_buffer:next(Idx, SndBuf),
+     0..|        {Next, SndBuf};
+        |      Seg when Seg#kcp_seg.sn =:= Sn ->
+     0..|        Buf2 = ditch_buffer:delete(Idx, Prev, SndBuf),
+     0..|        {?LAST_INDEX, Buf2};
+        |      Seg when Seg#kcp_seg.sn > Sn ->
+     0..|        {?LAST_INDEX, SndBuf};
+        |      Seg when Seg#kcp_seg.sn < Sn ->
+     0..|        Next = ditch_buffer:next(Idx, SndBuf),
+     0..|        {Next, SndBuf}
+        |    end,
+     0..|    kcp_parse_ack2(SndBuf2, Next2, Idx, Sn).
+        |  
+        |  %% Erase all recved seg from snd_buf
+        |  kcp_parse_una(KCP, Una) ->
+    32..|    First = ditch_buffer:first(KCP#kcp_pcb.snd_buf),
+    32..|    SndBuf2 = kcp_parse_una2(KCP#kcp_pcb.snd_buf, First, ?LAST_INDEX, Una),
+    32..|    KCP#kcp_pcb{snd_buf = SndBuf2}.
+        |  
+    32..|  kcp_parse_una2(SndBuf, ?LAST_INDEX, _, _) -> SndBuf;
+        |  kcp_parse_una2(SndBuf, Idx, Prev, Una) ->
+     0..|    {Next2, SndBuf2} = case ditch_buffer:get_data(Idx, SndBuf) of
+        |      undefined ->
+     0..|        Next = ditch_buffer:next(Idx, SndBuf),
+     0..|        {Next, SndBuf};
+        |      Seg when Seg#kcp_seg.sn >= Una ->
+     0..|        {?LAST_INDEX, SndBuf};
+        |      _ ->
+     0..|        Next = ditch_buffer:next(Idx, SndBuf),
+     0..|        Buf2 = ditch_buffer:delete(Idx, Prev, SndBuf),
+     0..|        {Next, Buf2}
+        |    end,
+     0..|    kcp_parse_una2(SndBuf2, Next2, Idx, Una).
+        |  
+        |  kcp_rcv_finish(KCP, MaxAck, Una) ->
+    32..|    KCP2 = ?IF(MaxAck =:= undefined, KCP, kcp_parse_fastack(KCP, MaxAck)),
+    32..|    kcp_rcv_finish2(KCP2, Una).
+        |  
+        |  kcp_rcv_finish2(KCP = #kcp_pcb{snd_una = SndUna, cwnd = Cwnd, rmt_wnd = Rwnd}, Una)
+    32..|    when SndUna =< Una; Cwnd >= Rwnd -> KCP;
+        |  kcp_rcv_finish2(KCP, _Una) ->
+     0..|    #kcp_pcb{mss = Mss, cwnd = Cwnd, incr = Incr, ssthresh = Ssth, rmt_wnd = Rwnd} = KCP,
+     0..|    {Cwnd2, Incr2} = case Cwnd < Ssth of
+        |      true ->
+     0..|        {Cwnd + 1, Incr + Mss};
+        |      false ->
+     0..|        In2 = ?MAX(Incr, Mss),
+     0..|        In3 = In2 + (Mss * Mss) div In2 + (Mss div 16),
+     0..|        C2 = ?IF((Cwnd + 1) * Mss =< In3, Cwnd + 1, Cwnd),
+     0..|        {C2, In3}
+        |    end,
+     0..|    case Cwnd2 > Rwnd of
+        |      false ->
+     0..|        KCP#kcp_pcb{cwnd = Cwnd2, incr = Incr2};
+        |      true  -> 
+     0..|        KCP#kcp_pcb{cwnd = Rwnd, incr = Rwnd * Mss}
+        |    end.
+        |  
+        |  kcp_ack_push(KCP = #kcp_pcb{acklist = AckList}, Sn, Ts) ->
+    32..|    KCP#kcp_pcb{acklist = [{Sn, Ts} | AckList]}.
+        |  
+        |  kcp_parse_data(KCP = #kcp_pcb{rcv_nxt = RcvNxt, rcv_wnd = Rwnd}, #kcp_seg{sn = Sn})
+     0..|      when Sn >= RcvNxt + Rwnd; Sn < RcvNxt -> KCP;
+        |  kcp_parse_data(KCP, Seg) ->
+    32..|    #kcp_pcb{rcv_buf = RcvBuf, rcv_queue = RcvQue, rcv_nxt = RcvNxt} = KCP,
+    32..|    First = ditch_buffer:first(RcvBuf),
+    32..|    RcvBuf2 = kcp_parse_data2(RcvBuf, First, ?LAST_INDEX, Seg),
+    32..|    {RcvNxt2, RcvBuf3, RcvQue2} = check_and_move(RcvNxt, RcvBuf2, RcvQue),
+    32..|    KCP#kcp_pcb{rcv_buf = RcvBuf3, rcv_queue = RcvQue2, rcv_nxt = RcvNxt2}.
+        |  
+        |  kcp_parse_data2(RcvBuf, ?LAST_INDEX, Prev, Seg) ->
+    17..|    ditch_buffer:append(Prev, Seg, RcvBuf);
+        |  kcp_parse_data2(RcvBuf, Idx, Prev, Seg) ->
+    25..|    Next = ditch_buffer:next(Idx, RcvBuf),
+    25..|    case ditch_buffer:get_data(Idx, RcvBuf) of
+        |      undefined ->
+     0..|        RcvBuf;
+     0..|      #kcp_seg{sn = Sn} when Sn =:= Seg#kcp_seg.sn -> RcvBuf;
+        |      #kcp_seg{sn = Sn} when Sn < Seg#kcp_seg.sn ->
+    10..|        kcp_parse_data2(RcvBuf, Next, Idx, Seg);
+        |      #kcp_seg{sn = Sn} when Sn > Seg#kcp_seg.sn ->
+    15..|        ditch_buffer:append(Prev, Seg, RcvBuf)
+        |    end.
+        |  
+        |  check_and_move(RcvNxt, RcvBuf, RcvQueue) ->
+    59..|    First = ditch_buffer:first(RcvBuf),
+    59..|    check_and_move2(RcvNxt, ?LAST_INDEX, First, RcvBuf, RcvQueue).
+        |  
+        |  check_and_move2(RcvNxt, _, ?LAST_INDEX, RcvBuf, RcvQueue) ->
+    26..|    {RcvNxt, RcvBuf, RcvQueue};
+        |  check_and_move2(RcvNxt, Prev, Idx, RcvBuf, RcvQueue) ->
+    65..|    case ditch_buffer:get_data(Idx, RcvBuf) of
+     0..|      undefined -> {RcvNxt, RcvBuf, RcvQueue};
+        |      Seg = #kcp_seg{sn = Sn} when Sn =:= RcvNxt ->
+    32..|        Next = ditch_buffer:next(Idx, RcvBuf),
+    32..|        RcvBuf2 = ditch_buffer:delete(Idx, Prev, RcvBuf),
+    32..|        RcvQueue2 = ditch_queue:in(Seg, RcvQueue),
+    32..|        Prev2 = ?IF(ditch_buffer:first(RcvBuf2) =:= Next, ?LAST_INDEX, Idx),
+    32..|        check_and_move2(RcvNxt + 1, Prev2, Next, RcvBuf2, RcvQueue2);
+    33..|      _ -> {RcvNxt, RcvBuf, RcvQueue}
+        |    end.
+        |  
+        |  check_data_rcv(OldKCP, KCP) ->
+    32..|    OldLen = ?IF(OldKCP =:= undefined, 0, ditch_queue:len(OldKCP#kcp_pcb.rcv_queue)),
+        |    #kcp_pcb{rcv_queue = RcvQue, probe = Probe, rcv_nxt = RcvNxt, rcv_buf = RcvBuf,
+    32..|      rcv_wnd = RcvWnd, pid = RecvPID} = KCP,
+    32..|    Recover = ditch_queue:len(RcvQue) >= RcvWnd,
+    32..|    case OldLen =:= ditch_queue:len(RcvQue) of
+     5..|      true  -> KCP;
+        |      false ->
+    27..|        {RcvQue2, DataList} = check_data_rcv2(RcvQue, [], []),
+    27..|        {RcvNxt2, RcvBuf2, RcvQue3} = check_and_move(RcvNxt, RcvBuf, RcvQue2),
+    27..|        ?IF(DataList =:= [], ignore, RecvPID ! {kcp_data, KCP#kcp_pcb.conv, DataList}),
+    27..|        Probe2 = ?IF(Recover and (ditch_queue:len(RcvQue3) < RcvWnd), Probe bor ?KCP_ASK_TELL, Probe),
+    27..|        KCP#kcp_pcb{rcv_nxt = RcvNxt2, rcv_queue = RcvQue3, rcv_buf = RcvBuf2, probe = Probe2}
+        |    end.
+        |  
+        |  check_data_rcv2(RcvQue, PartList, DataList) ->
+    27..|    case ditch_queue:is_empty(RcvQue) of
+     0..|      true  -> {RcvQue, DataList};
+        |      false ->
+    27..|        case ditch_queue:get(RcvQue) of
+        |          #kcp_seg{frg = Frg, data = Data} when Frg =:= 0 ->
+     0..|            Data2 = util:binary_join(lists:reverse([Data | PartList])),
+     0..|            RcvQue2 = ditch_queue:drop(RcvQue),
+     0..|            check_data_rcv2(RcvQue2, [], [Data2 | DataList]);
+        |          #kcp_seg{frg = Frg, data = Data} ->
+    27..|            case ditch_queue:len(RcvQue) of
+        |              QueSize when QueSize >= (Frg + 1) ->
+     0..|                RcvQue2 = ditch_queue:drop(RcvQue),
+     0..|                check_data_rcv2(RcvQue2, [Data | PartList], DataList);
+        |              _ ->
+    27..|                {RcvQue, DataList}
+        |            end
+        |        end
+        |    end.
+        |  
+        |  %% Flush all sndbuf data out
+        |  kcp_update(Now, Socket, KCP) ->
+   173..|    #kcp_pcb{updated = Updated, ts_flush = TsFlush, interval = Interval} = KCP,
+   173..|    {Updated2, TsFlush2} = ?IF(Updated =:= false, {true, Now}, {Updated, TsFlush}),
+   173..|    Slap = Now - TsFlush2,
+   173..|    {Slap2, TsFlush3} = case (Slap >= 10000) or (Slap < -10000) of
+     0..|      true -> {0, Now};
+   173..|      false -> {Slap, TsFlush2}
+        |    end,
+   173..|    case Slap2 >= 0 of
+        |      false ->
+     0..|        KCP#kcp_pcb{current = Now, ts_flush = TsFlush3, updated = Updated2};
+        |      true  ->
+   173..|        TsFlush4 = TsFlush3 + Interval,
+   173..|        TsFlush5 = ?IF(Now > TsFlush4, Now + Interval, TsFlush4),
+   173..|        kcp_flush(Socket, KCP#kcp_pcb{current = Now, ts_flush = TsFlush5, updated = Updated2})
+        |    end.
+        |  
+        |  %% Flush all data into the internet
+     0..|  kcp_flush(_Socket, KCP = #kcp_pcb{updated = false}) -> KCP;
+        |  kcp_flush(Socket, KCP) ->
+   173..|    #kcp_pcb{conv = Conv, rcv_nxt = RcvNxt, rcv_queue = RcvQue, rcv_wnd = RWnd} = KCP,
+   173..|    Wnd = ?IF(ditch_queue:len(RcvQue) < RWnd, RWnd - ditch_queue:len(RcvQue), 0),
+   173..|    Seg = #kcp_seg{conv = Conv, cmd = ?KCP_CMD_ACK, frg = 0, wnd = Wnd, una = RcvNxt,
+        |      ts = 0, sn = 0, len = 0},
+   173..|    {KCP2, Buf2} = kcp_flush_ack(Socket, KCP, Seg),
+   173..|    {KCP3, Buf3} = kcp_probe_wnd(Socket, KCP2, Seg, Buf2),
+   173..|    {KCP4, Buf4} = kcp_flush_wnd(Socket, KCP3, Seg, Buf3),
+        |  %%  {KCP5, Buf4} = kcp_flush_sync(Socket, KCP4, Seg, Buf3),
+        |  %%  {KCP6, Buf5} = kcp_flush_syncack(Socket, KCP5, Seg, Buf4),
+   173..|    {KCP5, {Buf5, _Size5}} = kcp_flush_data(Socket, KCP4#kcp_pcb{probe = 0}, Seg, Buf4),
+   173..|    kcp_output2(Socket, KCP5#kcp_pcb.key, util:binary_join(Buf5)),
+   173..|    KCP5.
+        |  
+        |  kcp_flush_ack(Socket, KCP = #kcp_pcb{key = Key, acklist = AckList, mtu = Mtu}, Seg) ->
+   173..|    Buf = kcp_flush_ack2(Socket, Key, Seg, AckList, {[], 0}, Mtu),
+   173..|    {KCP#kcp_pcb{acklist = []}, Buf}.
+   173..|  kcp_flush_ack2(_Socket, _Key, _Seg, [], Buf, _Limit) -> Buf;
+        |  kcp_flush_ack2(Socket, Key, Seg, [{Sn, Ts} | Left], Buf, Limit) ->
+    32..|    #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
+    32..|    Bin = ?KCP_SEG(Conv, ?KCP_CMD_ACK, 0, Wnd, Ts, Sn, Una, 0, <<>>, <<>>),
+    32..|    Buf2 = kcp_output(Socket, Key, Bin, Buf, Limit),
+    32..|    kcp_flush_ack2(Socket, Key, Seg, Left, Buf2, Limit).
+        |  
+        |  %% Do not implement wnd probe right now
+        |  kcp_probe_wnd(Socket, KCP, Seg, Buf) ->
+   173..|    KCP2 = kcp_update_probe(KCP),
+   173..|    #kcp_pcb{key = Key, probe = Probe, mtu = Mtu} = KCP2,
+   173..|    #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
+   173..|    case (Probe band ?KCP_ASK_SEND) =/= 0 of
+   173..|      false -> {KCP2, Buf};
+        |      true  ->
+     0..|        Bin = ?KCP_SEG(Conv, ?KCP_CMD_WASK, 0, Wnd, 0, 0, Una, 0, <<>>, <<>>),
+     0..|        Buf2 = kcp_output(Socket, Key, Bin, Buf, Mtu),
+     0..|        {KCP2, Buf2}
+        |    end.
+        |  kcp_update_probe(KCP = #kcp_pcb{rmt_wnd = Rwnd}) when Rwnd =/= 0 ->
+   173..|    KCP#kcp_pcb{ts_probe = 0, probe_wait = 0};
+        |  kcp_update_probe(KCP) ->
+     0..|    #kcp_pcb{current = Current, ts_probe = TsProbe, probe_wait = PWait, probe = Probe} = KCP,
+     0..|    case KCP#kcp_pcb.probe_wait =:= 0 of
+        |      true ->
+     0..|        KCP#kcp_pcb{probe_wait = ?KCP_PROBE_INIT, ts_probe = Current + ?KCP_PROBE_INIT};
+        |      false when Current >= TsProbe ->
+     0..|        PWait2 = ?IF(PWait < ?KCP_PROBE_INIT, ?KCP_PROBE_INIT, PWait),
+     0..|        PWait3 = PWait2 + PWait2 div 2,
+     0..|        PWait4 = ?IF(PWait3 > ?KCP_PROBE_LIMIT, ?KCP_PROBE_LIMIT, PWait3),
+     0..|        TsProbe2 = Current + PWait4,
+     0..|        Probe2 = Probe bor ?KCP_ASK_SEND,
+     0..|        KCP#kcp_pcb{probe_wait = PWait4, ts_probe = TsProbe2, probe = Probe2};
+        |      false ->
+     0..|        KCP
+        |    end.
+        |  kcp_flush_wnd(_Socket, KCP = #kcp_pcb{probe = Probe}, _Seg, Buf)
+   173..|      when Probe band ?KCP_ASK_TELL =:= 0 -> {KCP, Buf};
+        |  kcp_flush_wnd(Socket, KCP, Seg, Buf) ->
+     0..|    #kcp_pcb{key = Key, mtu = Mtu} = KCP,
+     0..|    #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
+     0..|    Bin = ?KCP_SEG(Conv, ?KCP_CMD_WINS, 0, Wnd, 0, 0, Una, 0, <<>>, <<>>),
+     0..|    Buf2 = kcp_output(Socket, Key, Bin, Buf, Mtu),
+     0..|    {KCP, Buf2}.
+        |  
+        |  
+        |  kcp_flush_data(Socket, KCP, Seg, Buf) ->
+        |    #kcp_pcb{snd_wnd = SWnd, rmt_wnd = RWnd, nocwnd = NoCwnd, cwnd = CWnd,
+   173..|      fastresend = FastResend, nodelay = NoDelay, rx_rto = RxRto, current = Current} = KCP,
+   173..|    CalWnd = ?MIN(SWnd, RWnd),
+   173..|    CalWnd2 = ?IF(NoCwnd =:= 0, ?MIN(CWnd, CalWnd), CalWnd),
+   173..|    KCP2 = sndque_to_sndbuf(KCP, Seg#kcp_seg{ts = Current, resendts = Current, rto = RxRto}, CalWnd2),
+   173..|    Resent = ?IF(FastResend > 0, FastResend, 16#FFFFFFFF),
+   173..|    RtoMin = ?IF(NoDelay == 0, RxRto bsr 3, 0),
+   173..|    Invariant = {Socket, Resent, RtoMin, KCP2, CalWnd2, Seg#kcp_seg.wnd},
+   173..|    {KCP3, Buf2} = kcp_flush_data2(Invariant, Buf),
+   173..|    {KCP3, Buf2}.
+        |  
+        |  kcp_flush_data2(Invariant, Buf) ->
+   173..|    {_, _, _, #kcp_pcb{snd_buf = SndBuf}, _, _} = Invariant,
+   173..|    {KCP2, Buf2} = kcp_flush_data3(Invariant, SndBuf, ditch_buffer:first(SndBuf), Buf, false, false),
+   173..|    {KCP2, Buf2}.
+        |  
+        |  kcp_flush_data3(Invariant, SndBuf, ?LAST_INDEX, Buf, Change, Lost) ->
+   173..|    {_, FastResent, _, KCP, CalcWnd, _} = Invariant,
+   173..|    KCP2 = case Change of
+   173..|      false -> KCP#kcp_pcb{snd_buf = SndBuf};
+        |      true  ->
+     0..|        #kcp_pcb{snd_nxt = SndNxt, snd_una = SndUna, mss = Mss} = KCP,
+     0..|        Thresh2 = case (SndNxt - SndUna) div 2 of
+     0..|          V when V < ?KCP_THRESH_MIN -> ?KCP_THRESH_MIN;
+     0..|          V -> V
+        |        end,
+     0..|        CWnd2 = Thresh2 + FastResent,
+     0..|        KCP#kcp_pcb{snd_buf = SndBuf, cwnd = CWnd2, incr = CWnd2 * Mss, ssthresh = Thresh2}
+        |    end,
+   173..|    KCP3 = case Lost of
+        |      true ->
+     0..|        Thresh3 = ?MAX(?KCP_THRESH_MIN, CalcWnd div 2),
+     0..|        KCP2#kcp_pcb{ssthresh = Thresh3, cwnd = 1, incr = KCP2#kcp_pcb.mss};
+   173..|      false -> KCP2
+        |    end,
+   173..|    KCP4 = case KCP3#kcp_pcb.cwnd < 1 of
+     1..|      true -> KCP3#kcp_pcb{cwnd = 1, incr = KCP3#kcp_pcb.mss};
+   172..|      false -> KCP3
+        |    end,
+   173..|    {KCP4, Buf};
+        |  kcp_flush_data3(Invariant, SndBuf, Idx, Buf, Change, Lost) ->
+     0..|    {Socket, FastResent, RtoMin, KCP, _, SWnd} = Invariant,
+     0..|    #kcp_pcb{current = Current, rx_rto = Rto, nodelay = NoDelay, mtu = Mtu, key = Key, rcv_nxt = RcvNxt} = KCP,
+     0..|    Next = ditch_buffer:next(Idx, SndBuf),
+     0..|    case ditch_buffer:get_data(Idx, SndBuf) of
+        |      undefined ->
+     0..|        kcp_flush_data3(Invariant, SndBuf, Next, Buf, Change, Lost);
+        |      Seg = #kcp_seg{xmit = Xmit, resendts = ResentTs, fastack = FastAck, rto = SRto} ->
+     0..|        {Send, Lost2, Change2, Seg2} = if
+        |          Xmit =:= 0 ->
+     0..|            S2 = Seg#kcp_seg{xmit = Xmit + 1, rto = Rto, resendts = Current + Rto + RtoMin},
+     0..|            {true, Lost, Change, S2};
+        |          Current >= ResentTs ->
+     0..|            SRto2 = ?IF(NoDelay =:= 0, SRto + Rto, SRto + Rto div 2),
+     0..|            S2 = Seg#kcp_seg{xmit = Xmit + 1, rto = SRto2, resendts = Current + SRto2},
+     0..|            {true, true, Change, S2};
+        |          FastAck >= FastResent ->
+     0..|            S2 = Seg#kcp_seg{xmit = Xmit + 1, fastack = 0, resendts = Current + Rto},
+     0..|            {true, Lost, true, S2};
+     0..|          true -> {false, Lost, Change, Seg}
+        |        end,
+        |  
+     0..|        SndBuf2 = case Send of
+     0..|          true  -> ditch_buffer:set_data(Idx, Seg2, SndBuf);
+     0..|          false -> SndBuf
+        |        end,
+     0..|        case Send =:= true of
+        |          true ->
+     0..|            Seg3 = Seg2#kcp_seg{ts = Current, wnd = SWnd, una = RcvNxt},
+     0..|            #kcp_seg{conv = Conv, frg = Frg, wnd = Wnd, ts = Ts, sn = Sn, una = Una, len = Len, data = Data} = Seg3,
+     0..|            Bin = ?KCP_SEG(Conv, ?KCP_CMD_PUSH, Frg, Wnd, Ts, Sn, Una, Len, Data, <<>>),
+     0..|            Buf2 = kcp_output(Socket, Key, Bin, Buf, Mtu),
+     0..|            SndBuf3 = ditch_buffer:set_data(Idx, Seg3, SndBuf2),
+     0..|            kcp_flush_data3(Invariant, SndBuf3, Next, Buf2, Change2, Lost2);
+        |          false ->
+     0..|            kcp_flush_data3(Invariant, SndBuf2, Next, Buf, Change2, Lost2)
+        |        end
+        |    end.
+        |  
+        |  sndque_to_sndbuf(KCP, Seg, CWnd) ->
+   173..|    #kcp_pcb{snd_queue = SndQue, snd_buf = SndBuf, snd_nxt = SndNxt, snd_una = SndUna} = KCP,
+   173..|    case ditch_queue:len(SndQue) =:= 0 of
+   173..|      true -> KCP;
+        |      false ->
+     0..|        {SndNxt2, SndQue2, SndBuf2} = sndque_to_sndbuf2(SndNxt, SndUna + CWnd, Seg, SndQue, SndBuf),
+     0..|        KCP#kcp_pcb{snd_nxt = SndNxt2, snd_queue = SndQue2, snd_buf = SndBuf2}
+        |    end.
+        |  sndque_to_sndbuf2(SndNxt, Limit, _Seg, SndQue, SndBuf) when SndNxt >= Limit ->
+     0..|    {SndNxt, SndQue, SndBuf};
+        |  sndque_to_sndbuf2(SndNxt, Limit, Seg, SndQue, SndBuf) ->
+     0..|    #kcp_seg{frg = Frg, len = Len, data = Data} = ditch_queue:get(SndQue),
+     0..|    SndQue2 = ditch_queue:drop(SndQue),
+     0..|    NSeg = Seg#kcp_seg{cmd = ?KCP_CMD_PUSH, sn = SndNxt, frg = Frg, len = Len, data = Data},
+     0..|    SndBuf2 = ditch_buffer:append_tail(NSeg, SndBuf),
+     0..|    sndque_to_sndbuf2(SndNxt + 1, Limit, Seg, SndQue2, SndBuf2).
+        |  
+     0..|  kcp_send(KCP, [], 0) -> KCP;
+        |  kcp_send(KCP = #kcp_pcb{snd_queue = SndQue}, [Data | Left], Frg) ->
+     0..|    Seg = #kcp_seg{len = byte_size(Data), frg = Frg - 1, data = Data},
+     0..|    SndQue2 = ditch_queue:in(Seg, SndQue),
+     0..|    KCP2 = KCP#kcp_pcb{snd_queue = SndQue2},
+     0..|    kcp_send(KCP2, Left, Frg - 1).
+        |  
+        |  kcp_output(Socket, Key, Bin, {Buf, Size}, Limit) ->
+    32..|    {Buf2, Size2} = case Size + ?KCP_OVERHEAD > Limit of
+        |      true ->
+     0..|        Data = util:binary_join(Buf),
+     0..|        kcp_output2(Socket, Key, Data),
+     0..|        {[], 0};
+        |      false ->
+    32..|        {Buf, Size}
+        |    end,
+    32..|    Size3 = Size2 + byte_size(Bin),
+    32..|    Buf3 = [Bin | Buf2],
+    32..|    {Buf3, Size3}.
+        |  
+   170..|  kcp_output2(_Socket, _Key, <<>>) -> ok;
+        |  kcp_output2(Socket, {IP, Port}, Data) ->
+     3..|    case gen_udp:send(Socket, IP, Port, Data) of
+     3..|      ok -> ok;
+        |      {error, Reason} ->
+     0..|        ?ERRORLOG("send udp data to ~p failed with reason ~p", [{IP, Port}, Reason]),
+     0..|        {error, Reason}
+        |    end.
+        |  
+        |  %%kcp_flush_syncack(_Socket, KCP = #kcp_pcb{probe = Probe}, _Seg, Buf)
+        |  %%    when Probe band ?KCP_SYNC_ACK_SEND =:= 0 -> {KCP, Buf};
+        |  %%kcp_flush_syncack(Socket, KCP, Seg, {Buf, Size}) ->
+        |  %%  #kcp_pcb{key = Key, mtu = Mtu} = KCP,
+        |  %%  #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
+        |  %%  Bin = ?KCP_SEG(Conv, ?KCP_CMD_SYNC_ACK, 0, Wnd, 0, 0, Una, 0, <<>>, <<>>),
+        |  %%  Buf2 = kcp_output(Socket, Key, Bin, Buf, Size, Mtu),
+        |  %%  {KCP, Buf2}.
+        |  %%
+        |  %%kcp_flush_sync(_Socket, KCP = #kcp_pcb{probe = Probe}, _Seg, Buf)
+        |  %%    when Probe band ?KCP_SYNC_SEND =:= 0 -> {KCP, Buf};
+        |  %%kcp_flush_sync(Socket, KCP, Seg, {Buf, Size}) ->
+        |  %%  #kcp_pcb{key = Key, mtu = Mtu} = KCP,
+        |  %%  #kcp_seg{conv = Conv, wnd = Wnd, una = Una} = Seg,
+        |  %%  Bin = ?KCP_SEG(Conv, ?KCP_CMD_SYNC, 0, Wnd, 0, 0, Una, 0, <<>>, <<>>),
+        |  %%  Buf2 = kcp_output(Socket, Key, Bin, Buf, Size, Mtu),
+        |  %%  {KCP, Buf2}.
+        |  
+        |  dump_kcp(#kcp_pcb{snd_buf = SndBuf, rcv_buf = RcvBuf}) ->
+     0..|    NSndBuf = ditch_buffer:unused(SndBuf),
+     0..|    NRcvBuf = ditch_buffer:unused(RcvBuf),
+     0..|    ?DEBUGLOG("kcp state ~p", [{NSndBuf, NRcvBuf}]).

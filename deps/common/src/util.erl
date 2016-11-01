@@ -57,7 +57,7 @@ binary_split(Data, Len) ->
 binary_split2(_, <<>>, Rslt) -> lists:reverse(Rslt);
 binary_split2(Len, Data, Rslt) ->
   case Data of
-    <<Head:Len/binary, Left>> -> binary_split2(Len, Left, [Head | Rslt]);
+    <<Head:Len/bytes, Left/bitstring>> -> binary_split2(Len, Left, [Head | Rslt]);
     _ -> binary_split2(Len, <<>>, [Data | Rslt])
   end.
 
