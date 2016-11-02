@@ -115,7 +115,7 @@ handle_info({shoot, Socket, Conv, Ref}, State) ->
   {noreply, State#state{sock = Socket, conv = Conv, ref = Ref}};
 handle_info({kcp_data, Conv, DataList}, State = #state{conv = Conv, ref = Ref}) ->
   Data = util:binary_join(DataList),
-%%  ?DEBUGLOG("~p recv data with conv ~p ~p ~p", [self(), Conv, Ref, size(Data)]),
+  ?DEBUGLOG("~p recv data with conv ~p ~p ~p", [self(), Conv, Ref, length(DataList)]),
   ditch_kcp:send_data(Ref, Data),
   {noreply, State};
 handle_info(_Info, State) ->

@@ -720,6 +720,7 @@ kcp_flush_data3(Invariant, SndBuf, Idx, Buf, Change, Lost) ->
           #kcp_seg{conv = Conv, frg = Frg, wnd = Wnd, ts = Ts, sn = Sn, una = Una, len = Len, data = Data} = Seg3,
           Bin = ?KCP_SEG(Conv, ?KCP_CMD_PUSH, Frg, Wnd, Ts, Sn, Una, Len, Data, <<>>),
           Buf2 = kcp_output(Socket, Key, Bin, Buf, Mtu),
+          ?DEBUGLOG("flush data3 for ~p ~p ~p", [Conv, Frg, Len]),
           SndBuf3 = ditch_buffer:set_data(Idx, Seg3, SndBuf2),
           kcp_flush_data3(Invariant, SndBuf3, Next, Buf2, Change2, Lost2);
         false ->
